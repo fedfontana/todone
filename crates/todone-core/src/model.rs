@@ -27,10 +27,13 @@ pub struct Comment {
     pub language: String,
 }
 
-/// A maximal run of adjacent comment nodes: comments on the same line or on
+/// A run of attached comment nodes: comments on the same line or on
 /// immediately consecutive lines are considered attached and are removed
 /// together.
 ///
+/// The scanner splits a run at blank lines and at every *matched* comment,
+/// so a run produced by a scan carries exactly one matched comment (the
+/// finding's `primary`); the remaining comments are its attached neighbours.
 /// Removing a run as a unit is what lets a `// TODO` followed by an
 /// explanatory `// note` disappear in one edit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -107,15 +110,19 @@ impl Selection {
     }
 }
 
-/// One actionable unit produced by the scanner: a comment run that contains a
-/// category match.
+/// One actionable unit produced by the scanner: a comment run that contains
+/// a category match.
+///
+/// The scanner emits one finding *per matched comment*; adjacent marker
+/// comments never merge into a single finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Finding {
     /// The attached comment run the match belongs to.
     pub run: CommentRun,
     /// The category that matched, e.g. `TODO`.
     pub category: String,
-    /// Index into `run.comments` of the first comment that matched.
+    /// Index into `run.comments` of the matched comment. Runs produced by
+    /// the scan contain exactly one match, so this is stable per finding.
     pub primary: usize,
     /// The comments the user chose to act on; defaults to the full run.
     pub selection: Selection,

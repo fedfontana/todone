@@ -59,12 +59,11 @@ fn scan_prints_findings_with_context() {
         .assert()
         .success()
         .stdout(predicate::str::contains("src/main.rs:2: TODO"))
+        .stdout(predicate::str::contains("src/main.rs:3: FIXME"))
         .stdout(predicate::str::contains("lib.py:2: TODO"))
         .stdout(predicate::str::contains("│     // TODO: fix this"))
-        // The FIXME on the next line is part of the same run and shows up
-        // in the context rather than as its own finding.
-        .stdout(predicate::str::contains("src/main.rs:3: FIXME").not())
-        .stdout(predicate::str::contains("// FIXME: and this"));
+        // Adjacent markers are reported independently now.
+        .stdout(predicate::str::contains("│     // FIXME: and this"));
 }
 
 #[test]
@@ -80,12 +79,16 @@ fn scan_json_output_is_parseable_and_complete() {
         .clone();
     let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
     let findings = report["findings"].as_array().unwrap();
-    assert_eq!(findings.len(), 2);
+    assert_eq!(findings.len(), 3);
     assert_eq!(findings[0]["category"], "TODO");
     assert_eq!(findings[0]["path"], "lib.py");
     assert_eq!(findings[1]["path"], "src/main.rs");
     assert_eq!(findings[1]["line"], 2);
-    assert_eq!(findings[1]["comments"].as_array().unwrap().len(), 2);
+    assert_eq!(findings[1]["comments"].as_array().unwrap().len(), 1);
+    // The adjacent FIXME is its own finding now, not part of run #2.
+    assert_eq!(findings[2]["path"], "src/main.rs");
+    assert_eq!(findings[2]["line"], 3);
+    assert_eq!(findings[2]["category"], "FIXME");
     assert!(report["repo"]["root"].is_string());
     assert!(report["stats"]["files"].is_u64());
 }
@@ -235,6 +238,8 @@ fn port_auto_delete_removes_comments() {
         .assert()
         .success()
         .stdout(predicate::str::contains("deleted comment"))
+        // A scan now reports the adjacent TODO and FIXME separately.
+        .stdout(predicate::str::contains("3/3"))
         .stdout(predicate::str::contains("done"));
     assert_eq!(
         fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
@@ -259,7 +264,7 @@ fn port_auto_delete_json() {
         .clone();
     let results: serde_json::Value = serde_json::from_slice(&output).unwrap();
     let results = results.as_array().unwrap();
-    assert_eq!(results.len(), 2);
+    assert_eq!(results.len(), 3);
     assert!(
         results
             .iter()

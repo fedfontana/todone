@@ -124,11 +124,7 @@ fn auto_decide(session: &mut Session, auto: AutoDecision) {
 /// Builds a draft from the comment text, for `--auto port`.
 fn auto_draft(finding: &Finding, commit: &str) -> IssueDraft {
     let primary = &finding.run.comments[finding.primary];
-    let mut title: String = primary.text.lines().next().unwrap_or("").trim().to_string();
-    if title.len() > 72 {
-        title.truncate(72);
-        title.push_str("...");
-    }
+    let title = todone_core::draft::issue_title(&primary.text, &finding.category);
     IssueDraft {
         category: finding.category.clone(),
         path: finding.path().to_path_buf(),
@@ -170,76 +166,98 @@ pub struct IssueJson {
 /// Executes the session against `forge`, applying removals through the
 /// repository at `root`. Ports create the issue first; the comment is only
 /// removed after the issue exists. Deletes remove the comment directly.
+///
+/// Removals are grouped per file and applied in a single pass, so several
+/// findings in the same file (a scan now emits one finding per matched
+/// comment) are edited once against the original scan snapshot.
 pub fn execute(
     session: &Session,
     forge: &dyn Forge,
     snapshots: &HashMap<PathBuf, FileSnapshot>,
     root: &std::path::Path,
 ) -> Vec<ExecutionResult> {
-    let mut results = Vec::new();
-    for (index, finding) in session.findings.iter().enumerate() {
-        let mut result = ExecutionResult {
+    let mut results: Vec<ExecutionResult> = session
+        .findings
+        .iter()
+        .enumerate()
+        .map(|(index, _)| ExecutionResult {
             index,
             action: "skip",
             issue: None,
             removed: false,
             error: None,
-        };
-        match session.decision(index) {
-            Some(Decision::Skip) | None => {}
+        })
+        .collect();
+
+    // The indices whose comments should be removed once the issues exist,
+    // grouped by file.
+    let mut removals: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    for (index, finding) in session.findings.iter().enumerate() {
+        let result = &mut results[index];
+        let path = finding.path().to_path_buf();
+        match session.decision(index).cloned() {
+            None | Some(Decision::Skip) => {}
             Some(Decision::Delete) => {
                 result.action = "delete";
-                match remove(finding, root, snapshots) {
-                    Ok(()) => result.removed = true,
-                    Err(err) => result.error = Some(err.to_string()),
-                }
+                removals.entry(path).or_default().push(index);
             }
             Some(Decision::Port(draft)) => {
                 result.action = "port";
-                match forge.create_issue(draft) {
+                match forge.create_issue(&draft) {
                     Ok(created) => {
                         result.issue = Some(IssueJson {
                             number: created.number,
                             url: created.url,
                         });
-                        match remove(finding, root, snapshots) {
-                            Ok(()) => result.removed = true,
-                            Err(err) => {
-                                result.error = Some(format!(
-                                    "issue {} created, but the comment could not be removed: {err}",
-                                    created.number
-                                ))
-                            }
-                        }
+                        removals.entry(path).or_default().push(index);
                     }
                     Err(err) => result.error = Some(format!("issue not created: {err}")),
                 }
             }
         }
-        results.push(result);
     }
-    results
-}
 
-/// Removes the finding's selected comments, verifying the file is unchanged
-/// since the scan snapshot.
-fn remove(
-    finding: &Finding,
-    root: &std::path::Path,
-    snapshots: &HashMap<PathBuf, FileSnapshot>,
-) -> anyhow::Result<()> {
-    let path = finding.path();
-    let expected = snapshots
-        .get(path)
-        .with_context(|| format!("no snapshot for {}", path.display()))?;
-    let ranges: Vec<std::ops::Range<usize>> = finding.run.comments
-        [finding.selection.start..=finding.selection.end]
-        .iter()
-        .map(|comment| comment.byte_range.clone())
-        .collect();
-    apply_removal(&root.join(path), &ranges, expected)
-        .map(|_| ())
-        .map_err(anyhow::Error::from)
+    // Apply every file's selected comment ranges at once, verifying the file
+    // is unchanged since the scan snapshot.
+    for (path, indices) in removals {
+        let Some(expected) = snapshots.get(&path) else {
+            for index in &indices {
+                results[*index].error = Some(format!("no snapshot for {}", path.display()));
+            }
+            continue;
+        };
+        let ranges: Vec<std::ops::Range<usize>> = indices
+            .iter()
+            .flat_map(|&index| {
+                let finding = &session.findings[index];
+                finding.run.comments[finding.selection.start..=finding.selection.end]
+                    .iter()
+                    .map(|comment| comment.byte_range.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        match apply_removal(&root.join(&path), &ranges, expected) {
+            Ok(_) => {
+                for index in &indices {
+                    results[*index].removed = true;
+                }
+            }
+            Err(err) => {
+                for index in &indices {
+                    let result = &mut results[*index];
+                    result.error = Some(match result.issue.as_ref() {
+                        Some(issue) => format!(
+                            "issue {} created, but the comment could not be removed: {err}",
+                            issue.number
+                        ),
+                        None => err.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    results
 }
 
 /// Prints the execution summary. Exits with code 1 when anything failed.
@@ -524,13 +542,57 @@ mod tests {
     }
 
     #[test]
+    fn execute_removes_adjacent_findings_in_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A scan reports each matched comment as its own finding, so this
+        // file yields two findings sharing one snapshot.
+        std::fs::write(root.join("a.rs"), "// TODO: a\n// FIXME: b\n").unwrap();
+        let run = |start, end, line: usize, text: &str, category: &str| Finding {
+            run: CommentRun {
+                comments: vec![Comment {
+                    path: "a.rs".into(),
+                    line,
+                    end_line: line,
+                    column: 0,
+                    byte_range: start..end,
+                    text: text.into(),
+                    language: "rust".into(),
+                }],
+            },
+            category: category.into(),
+            primary: 0,
+            selection: Selection::full(1),
+        };
+        let mut session = session_with(vec![
+            run(0, 10, 1, "// TODO: a", "TODO"),
+            run(11, 22, 2, "// FIXME: b", "FIXME"),
+        ]);
+        session.set_decision(0, Decision::Delete);
+        session.set_decision(1, Decision::Delete);
+        let snaps = snapshots(root, &session);
+
+        let runner = ScriptedRunner::new();
+        let forge = todone_forge::forge::GitHubForge::new(
+            Box::new(runner.clone()),
+            Some("o/r".into()),
+            None,
+        );
+        let results = execute(&session, &forge, &snaps, root);
+        assert!(results.iter().all(|r| r.removed && r.error.is_none()));
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "");
+    }
+
+    #[test]
     fn auto_decide_port_builds_drafts() {
         let mut session = session_with(vec![finding("a.rs", 1, "// TODO: fix this")]);
         auto_decide(&mut session, AutoDecision::Port);
         let Decision::Port(draft) = session.decision(0).unwrap() else {
             panic!("expected port");
         };
-        assert_eq!(draft.title, "// TODO: fix this");
+        // The title strips the `// TODO:` marker instead of copying it.
+        assert_eq!(draft.title, "fix this");
+        assert!(draft.description.contains("// TODO: fix this"));
         assert!(draft.description.contains("a.rs:1"));
         assert_eq!(draft.commit, "abc123");
     }

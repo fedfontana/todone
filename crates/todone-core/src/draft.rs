@@ -198,6 +198,57 @@ pub fn is_placeholder_title(title: &str) -> bool {
     title.trim() == TITLE_PLACEHOLDER
 }
 
+/// A suggested issue title from a comment, with the comment's decoration and
+/// category marker stripped: `// TODO: fix the bug` becomes `fix the bug`.
+///
+/// The leading marker characters (`//`, `/*`, `#`, `*`, ...) and the first
+/// occurrence of `category` are removed, along with the delimiter that
+/// follows the marker (`:`, `!`, `(`, or whitespace). Only the first line is
+/// considered; the result is trimmed and truncated to 72 columns.
+///
+/// Falls back to [`TITLE_PLACEHOLDER`] when the marker is not the first
+/// content token (the comment is not, in fact, a marker comment) or nothing
+/// remains after it (e.g. `// TODO` with no content).
+///
+/// # Examples
+///
+/// ```
+/// use todone_core::draft::{issue_title, TITLE_PLACEHOLDER};
+///
+/// assert_eq!(issue_title("// TODO: fix the bug", "TODO"), "fix the bug");
+/// assert_eq!(issue_title(" # FIXME! crash on load", "FIXME"), "crash on load");
+/// assert_eq!(issue_title("/* TODO: rethink */", "TODO"), "rethink");
+/// // No content after the marker: the user must write the title.
+/// assert_eq!(issue_title("// TODO", "TODO"), TITLE_PLACEHOLDER);
+/// // A doc comment that merely mentions the marker is not a title source.
+/// assert_eq!(issue_title("/// Triage TODO comments", "TODO"), TITLE_PLACEHOLDER);
+/// ```
+pub fn issue_title(comment: &str, category: &str) -> String {
+    let first = comment.lines().next().unwrap_or("");
+    let body = first.trim_start_matches(['/', '*', '#', ' ', '\t']);
+    let Some(head) = body.get(..category.len()) else {
+        return TITLE_PLACEHOLDER.to_string();
+    };
+    if !head.eq_ignore_ascii_case(category) {
+        return TITLE_PLACEHOLDER.to_string();
+    }
+    let rest = body.get(category.len()..).unwrap_or("");
+    let mut title: String = rest
+        .trim_start_matches([':', '!', '(', ' ', '\t'])
+        .trim()
+        // A single-line block comment leaves its closing `*/` behind.
+        .trim_end_matches(['/', '*'])
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        return TITLE_PLACEHOLDER.to_string();
+    }
+    if title.chars().count() > 72 {
+        title = format!("{}…", title.chars().take(72).collect::<String>());
+    }
+    title
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +364,41 @@ mod tests {
     fn placeholders_detected() {
         assert!(is_placeholder_title(TITLE_PLACEHOLDER));
         assert!(!is_placeholder_title("Real title"));
+    }
+
+    #[test]
+    fn issue_title_strips_the_marker() {
+        assert_eq!(issue_title("// TODO: fix the bug", "TODO"), "fix the bug");
+        assert_eq!(issue_title("/// FIXME: crash", "FIXME"), "crash");
+        assert_eq!(issue_title("# TODO: shell todo", "TODO"), "shell todo");
+        assert_eq!(issue_title("/* TODO: rethink */", "TODO"), "rethink");
+        assert_eq!(issue_title("//TODO: no space", "TODO"), "no space");
+        assert_eq!(issue_title("// FIXME! panic here", "FIXME"), "panic here");
+        assert_eq!(
+            issue_title(" * TODO: take the first line only\n * more\n */", "TODO"),
+            "take the first line only"
+        );
+    }
+
+    #[test]
+    fn issue_title_truncates_long_titles() {
+        let comment = format!("// TODO: {}", "word ".repeat(20));
+        let title = issue_title(&comment, "TODO");
+        assert_eq!(title.chars().count(), 72 + 1);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn issue_title_falls_back_to_the_placeholder() {
+        // Nothing after the marker.
+        assert_eq!(issue_title("// TODO", "TODO"), TITLE_PLACEHOLDER);
+        assert_eq!(issue_title("// TODO:", "TODO"), TITLE_PLACEHOLDER);
+        // Not a marker comment: the category is not the first content token.
+        assert_eq!(
+            issue_title("/// Triage TODO comments", "TODO"),
+            TITLE_PLACEHOLDER
+        );
+        assert_eq!(issue_title("// plain note", "TODO"), TITLE_PLACEHOLDER);
+        assert_eq!(issue_title("", "TODO"), TITLE_PLACEHOLDER);
     }
 }

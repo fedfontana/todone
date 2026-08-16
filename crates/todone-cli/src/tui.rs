@@ -508,11 +508,7 @@ impl PortApp {
     pub fn prefilled_draft(&self) -> Option<IssueDraft> {
         let finding = self.current()?;
         let comment = &finding.run.comments[finding.primary];
-        let mut title: String = comment.text.lines().next()?.trim().to_string();
-        if title.len() > 72 {
-            title.truncate(72);
-            title.push_str("...");
-        }
+        let title = todone_core::draft::issue_title(&comment.text, &finding.category);
         Some(IssueDraft {
             category: finding.category.clone(),
             path: comment.path.clone(),
@@ -529,8 +525,10 @@ impl PortApp {
 
     /// The snippet for the current finding, as embedded in drafts.
     ///
-    /// Surrounding code only: the selected comment lines do not belong in
-    /// the issue.
+    /// Surrounding code only: comment bytes are scrubbed out of the context
+    /// window, so neither the selected comment nor neighbouring markers leak
+    /// into the issue, while the code of an inline comment (`let x = // TODO`)
+    /// survives the scrub.
     pub fn current_snippet(&mut self) -> Option<ContextSnippet> {
         let cursor = self.session.cursor();
         let finding = self.session.findings.get(cursor).cloned()?;
@@ -538,12 +536,21 @@ impl PortApp {
         let source = self.source_of(&finding).to_string();
         let context = extract_context(&source, &finding, before, after);
         let primary = &finding.run.comments[finding.primary];
-        let lines: Vec<&str> = context
-            .lines
-            .iter()
-            .filter(|line| line.kind != LineKind::Selected)
-            .map(|line| line.text.as_str())
-            .collect();
+        let lines: Vec<String> = match self.comment_ranges_of(&finding) {
+            Some(ranges) => context
+                .lines
+                .iter()
+                .filter_map(|line| strip_ranges(&line.text, line.byte_range.start, &ranges))
+                .collect(),
+            // Without a loadable grammar fall back to dropping whole selected
+            // lines, as before.
+            None => context
+                .lines
+                .iter()
+                .filter(|line| line.kind != LineKind::Selected)
+                .map(|line| line.text.clone())
+                .collect(),
+        };
         let text = if lines.is_empty() {
             "(no surrounding context)".to_string()
         } else {
@@ -553,6 +560,52 @@ impl PortApp {
             language: primary.language.clone(),
             text,
         })
+    }
+
+    /// The file byte ranges of every comment in the finding's file, or
+    /// `None` when the grammar cannot be loaded.
+    fn comment_ranges_of(&mut self, finding: &Finding) -> Option<Vec<std::ops::Range<usize>>> {
+        let source = self.source_of(finding).to_string();
+        let lang = todone_core::language::by_extension(finding.path())?;
+        todone_core::scan::parse_comment_nodes(finding.path().to_path_buf(), lang, &source)
+            .ok()
+            .map(|comments| {
+                comments
+                    .into_iter()
+                    .map(|comment| comment.byte_range)
+                    .collect()
+            })
+    }
+}
+
+/// Removes the byte spans covered by `ranges` from a context line, trimming
+/// the result; `None` means the line held nothing but comments.
+fn strip_ranges(
+    text: &str,
+    line_offset: usize,
+    ranges: &[std::ops::Range<usize>],
+) -> Option<String> {
+    let line_start = line_offset;
+    let line_end = line_offset + text.len();
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for range in ranges {
+        let start = range.start.max(line_start).min(line_end) - line_start;
+        let end = range.end.max(line_start).min(line_end) - line_start;
+        if cursor < start {
+            out.push_str(&text[cursor..start]);
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < text.len() {
+        out.push_str(&text[cursor..]);
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        // Keep leading indentation; drop the whitespace left where the
+        // comment used to sit.
+        Some(out.trim_end().to_string())
     }
 }
 
@@ -1731,6 +1784,104 @@ mod tests {
         assert!(snippet.text.contains("fn before() {}"));
         assert!(snippet.text.contains("fn after() {}"));
         assert!(!snippet.text.contains("// TODO: x"));
+    }
+
+    #[test]
+    fn snippet_keeps_the_code_before_an_inline_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "fn before() {}\nlet x = 1; // TODO: x\nfn after() {}\n",
+        )
+        .unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: Some("abc".into()),
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let run = CommentRun {
+            comments: vec![Comment {
+                path: "src/a.rs".into(),
+                line: 2,
+                end_line: 2,
+                column: 11,
+                byte_range: 26..36,
+                text: "// TODO: x".into(),
+                language: "rust".into(),
+            }],
+        };
+        let finding = Finding {
+            run,
+            category: "TODO".into(),
+            primary: 0,
+            selection: Selection::full(1),
+        };
+        let mut app = PortApp::new(Session::new(vec![finding], "abc".into()), &ctx);
+        let snippet = app.current_snippet().unwrap();
+        assert!(snippet.text.contains("let x = 1;"));
+        assert!(!snippet.text.contains("// TODO: x"));
+    }
+
+    #[test]
+    fn snippet_never_includes_other_marker_comments() {
+        // Two marker comments split into separate findings: viewing the TODO
+        // must not leak the FIXME into the issue's context section.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "// TODO: something\n// and some continuation\n//\n// FIXME: some other\nfn after() {}\n",
+        )
+        .unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: Some("abc".into()),
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let run = CommentRun {
+            comments: vec![
+                Comment {
+                    path: "src/a.rs".into(),
+                    line: 1,
+                    end_line: 1,
+                    column: 0,
+                    byte_range: 0..15,
+                    text: "// TODO: something".into(),
+                    language: "rust".into(),
+                },
+                Comment {
+                    path: "src/a.rs".into(),
+                    line: 2,
+                    end_line: 2,
+                    column: 0,
+                    byte_range: 16..36,
+                    text: "// and some continuation".into(),
+                    language: "rust".into(),
+                },
+            ],
+        };
+        let finding = Finding {
+            run,
+            category: "TODO".into(),
+            primary: 0,
+            selection: Selection::full(2),
+        };
+        let mut app = PortApp::new(Session::new(vec![finding], "abc".into()), &ctx);
+        let snippet = app.current_snippet().unwrap();
+        assert!(!snippet.text.contains("// TODO: something"));
+        assert!(!snippet.text.contains("// FIXME: some other"));
+        assert!(snippet.text.contains("fn after() {}"));
     }
 
     #[test]
