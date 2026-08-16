@@ -315,14 +315,22 @@ impl PortApp {
         let finding = self.current()?;
         let context = self.contexts.get(self.session.cursor())?;
         let primary = &finding.run.comments[finding.primary];
+        // Surrounding code only: the comment lines themselves do not belong
+        // in the issue.
+        let lines: Vec<&str> = context
+            .lines
+            .iter()
+            .filter(|l| l.kind != crate::context::LineKind::Selected)
+            .map(|l| l.text.as_str())
+            .collect();
+        let text = if lines.is_empty() {
+            "(no surrounding context)".to_string()
+        } else {
+            lines.join("\n")
+        };
         Some(ContextSnippet {
             language: primary.language.clone(),
-            text: context
-                .lines
-                .iter()
-                .map(|l| l.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
+            text,
         })
     }
 }
@@ -858,6 +866,49 @@ mod tests {
         app.handle_key(Char('r'));
         let sel = app.current().unwrap().selection;
         assert_eq!((sel.start, sel.end), (0, 1));
+    }
+
+    #[test]
+    fn snippet_excludes_the_comment_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "fn before() {}\n// TODO: x\nfn after() {}\n",
+        )
+        .unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: Some("abc".into()),
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let run = CommentRun {
+            comments: vec![Comment {
+                path: "src/a.rs".into(),
+                line: 2,
+                end_line: 2,
+                column: 0,
+                byte_range: 15..25,
+                text: "// TODO: x".into(),
+                language: "rust".into(),
+            }],
+        };
+        let finding = Finding {
+            run,
+            category: "TODO".into(),
+            primary: 0,
+            selection: Selection::full(1),
+        };
+        let app = PortApp::new(Session::new(vec![finding], "abc".into()), &ctx);
+        let snippet = app.current_snippet().unwrap();
+        assert!(snippet.text.contains("fn before() {}"));
+        assert!(snippet.text.contains("fn after() {}"));
+        assert!(!snippet.text.contains("// TODO: x"));
     }
 
     fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {

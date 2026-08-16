@@ -9,7 +9,6 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::Context as _;
-use tempfile::NamedTempFile;
 use todone_core::config::EditorConfig;
 
 /// Resolves and runs editor sessions.
@@ -60,6 +59,10 @@ impl Editor {
     /// Opens `rel` (relative to `root`) for read-only inspection, at `line`
     /// when the editor supports it.
     ///
+    /// vim-family editors open the real file with `-R`; other editors get a
+    /// throwaway copy that keeps the original extension, so syntax
+    /// highlighting still applies.
+    ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be read or the editor cannot be
@@ -70,7 +73,14 @@ impl Editor {
         if self.supports_vim_flags() {
             self.run(&["-R", &format!("+{line}"), display.as_ref()])
         } else {
-            let mut tmp = NamedTempFile::new()
+            let suffix = path
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let mut tmp = tempfile::Builder::new()
+                .prefix("todone-view-")
+                .suffix(&suffix)
+                .tempfile()
                 .context("cannot create a temporary copy for the read-only view")?;
             let content = std::fs::read(&path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
@@ -138,7 +148,13 @@ pub fn edit_draft(
     snippet: &todone_core::draft::ContextSnippet,
 ) -> anyhow::Result<DraftOutcome> {
     let rendered = todone_core::draft::render_draft(draft, snippet);
-    let mut tmp = NamedTempFile::new().context("cannot create draft file")?;
+    // The .md suffix makes vim-family editors set ft=markdown, and keeps
+    // the file readable in any other editor.
+    let mut tmp = tempfile::Builder::new()
+        .prefix("todone-draft-")
+        .suffix(".md")
+        .tempfile()
+        .context("cannot create draft file")?;
     std::io::Write::write_all(&mut tmp, rendered.as_bytes()).context("cannot write draft file")?;
     let path = tmp.path().to_path_buf();
 
@@ -264,6 +280,69 @@ mod tests {
         assert!(args.contains("+3"));
         assert!(args.contains("a.rs"));
         unsafe { std::env::remove_var("FAKEVIM_OUT") };
+    }
+
+    #[test]
+    fn view_readonly_copy_keeps_the_original_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.py"), "code\n").unwrap();
+        // A non-vim editor: the view goes through a temp copy.
+        let fake = dir.path().join("fakeeditor");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_EDITOR_OUT\"\n",
+        )
+        .unwrap();
+        make_executable(&fake);
+        let editor = Editor {
+            command: vec![fake.to_string_lossy().into_owned()],
+        };
+        assert!(!editor.supports_vim_flags());
+        unsafe {
+            std::env::set_var(
+                "FAKE_EDITOR_OUT",
+                dir.path().join("args2").to_string_lossy().as_ref(),
+            )
+        };
+        editor
+            .view_readonly(dir.path(), Path::new("lib.py"), 1)
+            .unwrap();
+        let args = std::fs::read_to_string(dir.path().join("args2")).unwrap();
+        let copy = args.trim();
+        assert!(copy.starts_with("/tmp/"), "temp copy expected, got {copy}");
+        assert!(copy.ends_with(".py"), "extension must survive, got {copy}");
+        unsafe { std::env::remove_var("FAKE_EDITOR_OUT") };
+    }
+
+    #[test]
+    fn draft_temp_file_is_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        // A fake editor that echoes its argument and edits nothing.
+        let script = dir.path().join("echoedit.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$ECHO_OUT\"\n",
+        )
+        .unwrap();
+        make_executable(&script);
+        let editor = Editor {
+            command: vec![script.to_string_lossy().into_owned()],
+        };
+        unsafe {
+            std::env::set_var(
+                "ECHO_OUT",
+                dir.path().join("path.txt").to_string_lossy().as_ref(),
+            )
+        };
+        // Content unchanged -> aborted, but the path was recorded first.
+        let outcome = edit_draft(&editor, &draft(), &snippet()).unwrap();
+        assert_eq!(outcome, DraftOutcome::Aborted);
+        let path = std::fs::read_to_string(dir.path().join("path.txt")).unwrap();
+        assert!(
+            path.trim().ends_with(".md"),
+            "draft must be markdown, got {path}"
+        );
+        unsafe { std::env::remove_var("ECHO_OUT") };
     }
 
     #[test]

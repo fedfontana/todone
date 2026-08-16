@@ -84,7 +84,7 @@ pub fn render_draft(draft: &IssueDraft, snippet: &ContextSnippet) -> String {
          \n\
          ## Context\n\
          ```{language}\n\
-         {text}\
+         {text}\n\
          ```\n\
          \n\
          ## Description\n\
@@ -223,6 +223,15 @@ mod tests {
     fn render_parse_round_trip() {
         let rendered = render_draft(&draft(), &snippet());
         assert_eq!(parse_draft(&rendered).unwrap(), draft());
+    }
+
+    #[test]
+    fn context_fence_is_on_its_own_line() {
+        let rendered = render_draft(&draft(), &snippet());
+        assert!(
+            rendered.contains("fn main() { // TODO: crash\n```\n"),
+            "closing fence must not be glued to the snippet:\n{rendered}"
+        );
     }
 
     #[test]
