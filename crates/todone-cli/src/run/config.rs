@@ -15,10 +15,8 @@ pub fn run_config(out: &mut dyn Write, args: &ConfigArgs) -> anyhow::Result<()> 
         return Ok(());
     }
     let cwd = std::env::current_dir().context("cannot determine the current directory")?;
-    let repo = todone_core::repo::discover_repo(&cwd)?.unwrap_or(todone_core::repo::RepoInfo {
-        root: cwd,
-        commit: None,
-    });
+    let repo =
+        todone_core::repo::discover_repo(&cwd)?.unwrap_or_else(|| todone_core::repo::no_repo(cwd));
     let user_config = todone_core::config::user_config_path();
     let config = Config::load(&repo.root, user_config.as_deref(), &CliOverrides::default())?;
     write!(out, "{}", config.to_toml())?;

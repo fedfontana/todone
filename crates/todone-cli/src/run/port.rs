@@ -37,6 +37,10 @@ pub fn run_port(
     json: bool,
     _color: bool,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        context.repo.is_repo,
+        "not in a git repository; nothing to port (scan and config still work)"
+    );
     let scanner = Scanner::new(context.config.scan_options())?;
     let result = scanner.scan(&context.repo.root)?;
 
@@ -524,10 +528,7 @@ mod tests {
             ]),
             &crate::run::scan::ScanContext {
                 config: todone_core::config::Config::defaults(),
-                repo: todone_core::repo::RepoInfo {
-                    root: std::env::temp_dir(),
-                    commit: None,
-                },
+                repo: todone_core::repo::no_repo(std::env::temp_dir()),
             },
         );
         use ratatui::crossterm::event::KeyCode::Char;

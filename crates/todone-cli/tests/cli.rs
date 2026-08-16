@@ -8,6 +8,11 @@ use predicates::prelude::*;
 /// Creates a small fixture repository with comments in two languages.
 fn repo_fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(
         dir.path().join("src/main.rs"),
@@ -19,6 +24,25 @@ fn repo_fixture() -> tempfile::TempDir {
         "def f():\n    # TODO: python todo\n    pass\n",
     )
     .unwrap();
+    std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
     dir
 }
 
@@ -246,6 +270,11 @@ fn port_auto_delete_json() {
 #[test]
 fn port_no_findings_is_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
     fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
     todone()
         .current_dir(dir.path())
@@ -266,4 +295,178 @@ fn unknown_subcommand_fails() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("unrecognized subcommand"));
+}
+
+/// Creates a bare git repo at `dir` with a committed file.
+fn make_git_repo(dir: &std::path::Path, file: &str, content: &str) {
+    std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    let path = dir.join(file);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(&path, content).unwrap();
+    std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+}
+
+#[test]
+fn port_scope_in_another_repo_targets_that_repo() {
+    let parent = tempfile::tempdir().unwrap();
+    let a = parent.path().join("repo-a");
+    let b = parent.path().join("repo-b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    make_git_repo(&a, "a.rs", "fn a() {}\n");
+    make_git_repo(&b, "main.rs", "fn main() {\n    // TODO: fix\n}\n");
+
+    todone()
+        .current_dir(&a)
+        .args(["port", "--auto", "delete", "../repo-b"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deleted comment"))
+        // The context banner names repo-b as the target.
+        .stderr(predicate::str::contains(format!(
+            "repo {}",
+            b.canonicalize().unwrap().display()
+        )));
+
+    // The comment was removed from repo-b; repo-a is untouched.
+    assert_eq!(
+        fs::read_to_string(b.join("main.rs")).unwrap(),
+        "fn main() {\n}\n"
+    );
+    assert_eq!(fs::read_to_string(a.join("a.rs")).unwrap(), "fn a() {}\n");
+}
+
+#[test]
+fn scan_scope_in_another_repo_reports_that_repo() {
+    let parent = tempfile::tempdir().unwrap();
+    let a = parent.path().join("repo-a");
+    let b = parent.path().join("repo-b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    make_git_repo(&a, "a.rs", "fn a() {}\n");
+    make_git_repo(&b, "main.rs", "fn main() {\n    // TODO: fix\n}\n");
+    let b_root = b.canonicalize().unwrap();
+
+    let output = todone()
+        .current_dir(&a)
+        .args(["scan", "--json", "../repo-b"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        report["repo"]["root"],
+        b_root.to_string_lossy().into_owned()
+    );
+    assert_eq!(report["repo"]["is_repo"], true);
+    // The commit is repo-b's HEAD.
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&b)
+        .output()
+        .unwrap();
+    let commit = String::from_utf8_lossy(&commit.stdout).trim().to_string();
+    assert_eq!(report["repo"]["commit"], commit);
+    assert_eq!(report["findings"][0]["path"], "main.rs");
+}
+
+#[test]
+fn scope_in_another_repo_uses_that_repos_config() {
+    let parent = tempfile::tempdir().unwrap();
+    let a = parent.path().join("repo-a");
+    let b = parent.path().join("repo-b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    make_git_repo(&a, "a.rs", "fn a() {}\n");
+    make_git_repo(&b, "main.rs", "fn main() {\n    // TODO: fix\n}\n");
+    // repo-b configures a different category: the TODO must not match.
+    fs::write(
+        b.join("todone.toml"),
+        "[scan.match]\ncategories = [\"PERF\"]\n",
+    )
+    .unwrap();
+
+    todone()
+        .current_dir(&a)
+        .args(["scan", "../repo-b"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(": TODO").not());
+}
+
+#[test]
+fn scope_spanning_two_repos_warns_and_first_wins() {
+    let parent = tempfile::tempdir().unwrap();
+    let a = parent.path().join("repo-a");
+    let b = parent.path().join("repo-b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    make_git_repo(&a, "a.rs", "// TODO: in a\n");
+    make_git_repo(&b, "b.rs", "// TODO: in b\n");
+
+    todone()
+        .current_dir(&a)
+        .args(["scan", ".", "../repo-b"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("a.rs:1: TODO"))
+        .stderr(predicate::str::contains("spans multiple repositories"));
+}
+
+#[test]
+fn port_outside_a_repo_errors_scan_works() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("f.rs"), "// TODO: x\n").unwrap();
+
+    todone()
+        .current_dir(dir.path())
+        .args(["port", "--auto", "delete"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not in a git repository"));
+
+    todone()
+        .current_dir(dir.path())
+        .arg("scan")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("f.rs:1: TODO"))
+        .stderr(predicate::str::contains("no forge sink"));
+}
+
+#[test]
+fn missing_scope_path_errors() {
+    let dir = repo_fixture();
+    todone()
+        .current_dir(dir.path())
+        .args(["port", "--auto", "delete", "does-not-exist"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("path does not exist"));
 }

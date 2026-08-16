@@ -26,6 +26,10 @@ pub struct RepoReport {
     pub root: PathBuf,
     /// `HEAD` commit hash, when the repo has commits.
     pub commit: Option<String>,
+    /// Whether the root is an actual git repository.
+    pub is_repo: bool,
+    /// The `origin` remote URL, when the repo has one.
+    pub remote: Option<String>,
 }
 
 /// One finding, with its context window.

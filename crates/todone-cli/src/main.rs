@@ -32,9 +32,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run(cli: Cli, out: &mut dyn std::io::Write, color: bool) -> anyhow::Result<()> {
+    let mut err = std::io::stderr().lock();
     match cli.command {
         Command::Scan(args) => {
-            let context = run::scan::load_context(&args.common, None, None)
+            let context = run::scan::load_context(&args.common, None, None, &mut err)
                 .context("failed to set up the scan")?;
             run::scan::run_scan(out, &context, cli.json, color)
         }
@@ -43,6 +44,7 @@ fn run(cli: Cli, out: &mut dyn std::io::Write, color: bool) -> anyhow::Result<()
                 &args.common,
                 args.forge.as_deref(),
                 args.editor.as_deref(),
+                &mut err,
             )
             .context("failed to set up the port session")?;
             run::port::run_port(out, &context, &args, cli.json, color)

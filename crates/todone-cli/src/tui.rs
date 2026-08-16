@@ -412,6 +412,10 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, app: &PortApp) {
         format!("  ({} undecided)", app.session.undecided_count()),
         Style::default().fg(Color::DarkGray),
     ));
+    line.spans.push(Span::styled(
+        format!("\n repo: {}", app.root.display()),
+        Style::default().fg(Color::DarkGray),
+    ));
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -718,6 +722,8 @@ mod tests {
         let repo = todone_core::repo::RepoInfo {
             root: dir.path().to_path_buf(),
             commit: Some("abc".into()),
+            is_repo: true,
+            remote: None,
         };
         let ctx = ScanContext {
             config: todone_core::config::Config::defaults(),

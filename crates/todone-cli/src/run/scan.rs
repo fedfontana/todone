@@ -49,26 +49,57 @@ pub struct ScanContext {
     pub repo: RepoInfo,
 }
 
-/// Resolves the repository root and loads the configuration.
+/// Resolves the repository root from the scan scope and loads the
+/// configuration. Prints the repo context (root, commit, remote, forge)
+/// and any scope warnings to `err`.
 pub fn load_context(
     args: &CommonScanArgs,
     forge: Option<&str>,
     editor: Option<&str>,
+    err: &mut dyn Write,
 ) -> anyhow::Result<ScanContext> {
     let cwd = std::env::current_dir().context("cannot determine the current directory")?;
-    let repo = todone_core::repo::discover_repo(&cwd)?.unwrap_or(RepoInfo {
-        root: cwd,
-        commit: None,
-    });
+    let scope = todone_core::repo::resolve_scope(&cwd, &args.paths)
+        .context("failed to resolve the scan scope")?;
+    let repo = scope.repo;
 
     let mut overrides = overrides(args);
     overrides.forge = forge.map(str::to_string);
     overrides.editor = editor.map(str::to_string);
+    overrides.paths = (!scope.targets.is_empty()).then(|| scope.targets.clone());
 
     let user_config = todone_core::config::user_config_path();
     let config = Config::load(&repo.root, user_config.as_deref(), &overrides)
         .context("invalid configuration")?;
+
+    print_repo_context(err, &repo, &config, &scope.warnings)?;
     Ok(ScanContext { config, repo })
+}
+
+/// Prints the effective repo context and any scope warnings, so the user
+/// can verify which repository is being operated on.
+pub fn print_repo_context(
+    out: &mut dyn Write,
+    repo: &RepoInfo,
+    config: &Config,
+    warnings: &[String],
+) -> anyhow::Result<()> {
+    let commit = repo
+        .commit
+        .as_deref()
+        .map(|c| &c[..c.len().min(8)])
+        .unwrap_or("none");
+    let remote = repo.remote.as_deref().unwrap_or("none");
+    writeln!(
+        out,
+        "todone: repo {} (commit {commit}, remote {remote}, forge {})",
+        repo.root.display(),
+        config.forge.kind
+    )?;
+    for warning in warnings {
+        writeln!(out, "todone: warning: {warning}")?;
+    }
+    Ok(())
 }
 
 /// Runs a scan and prints the report to `out`.
@@ -154,6 +185,8 @@ pub fn build_report(result: &todone_core::scan::ScanResult, context: &ScanContex
         repo: RepoReport {
             root: context.repo.root.clone(),
             commit: context.repo.commit.clone(),
+            is_repo: context.repo.is_repo,
+            remote: context.repo.remote.clone(),
         },
         findings,
         stats: result.stats,
