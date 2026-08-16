@@ -3,6 +3,7 @@
 //! user-defined categories, removing comments from source, layered
 //! configuration, and the interactive session state machine.
 
+pub mod config;
 pub mod language;
 pub mod matcher;
 pub mod model;

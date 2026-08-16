@@ -21,6 +21,9 @@ pub struct ScanOptions {
     /// Paths relative to the repo root to scan; may name files or
     /// directories. Empty means the whole repo.
     pub paths: Vec<PathBuf>,
+    /// Glob patterns (relative to the repo root) to exclude from scanning,
+    /// e.g. `vendor/**`.
+    pub exclude: Vec<String>,
     /// Which comments count as marker comments.
     pub match_config: MatchConfig,
     /// Files larger than this many bytes are skipped.
@@ -31,6 +34,7 @@ impl Default for ScanOptions {
     fn default() -> Self {
         Self {
             paths: Vec::new(),
+            exclude: Vec::new(),
             match_config: MatchConfig::default(),
             max_file_bytes: 10 * 1024 * 1024,
         }
@@ -113,7 +117,7 @@ impl Scanner {
     ///
     /// Returns an error if a file cannot be read or parsed.
     pub fn scan(&self, root: &Path) -> Result<ScanResult, ScanError> {
-        let mut files = collect_files(root, &self.options.paths);
+        let mut files = collect_files(root, &self.options);
         files.sort();
         files.dedup();
 
@@ -234,13 +238,14 @@ fn first_match<'a>(run: &CommentRun, matcher: &'a Matcher) -> Option<(usize, &'a
 ///   `.gitignore` and skipping hidden entries (ripgrep defaults).
 /// - With a scope, each path is walked individually; explicitly named files
 ///   are always included, even when hidden or ignored.
-fn collect_files(root: &Path, scope: &[PathBuf]) -> Vec<PathBuf> {
+/// - Exclude globs (relative to `root`) prune matching subtrees.
+fn collect_files(root: &Path, options: &ScanOptions) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    if scope.is_empty() {
-        walk_into(root, &mut files);
+    if options.paths.is_empty() {
+        walk_into(root, options, &mut files);
     } else {
         let mut seen: HashSet<PathBuf> = HashSet::new();
-        for rel in scope {
+        for rel in &options.paths {
             let target = root.join(rel);
             if target.is_file() {
                 if seen.insert(target.clone()) {
@@ -248,13 +253,13 @@ fn collect_files(root: &Path, scope: &[PathBuf]) -> Vec<PathBuf> {
                 }
                 continue;
             }
-            walk_into(&target, &mut files);
+            walk_into(&target, options, &mut files);
         }
     }
     files
 }
 
-fn walk_into(target: &Path, files: &mut Vec<PathBuf>) {
+fn walk_into(target: &Path, options: &ScanOptions, files: &mut Vec<PathBuf>) {
     let mut builder = WalkBuilder::new(target);
     builder
         .git_ignore(true)
@@ -264,6 +269,17 @@ fn walk_into(target: &Path, files: &mut Vec<PathBuf>) {
         .hidden(true)
         .parents(true)
         .follow_links(false);
+
+    if !options.exclude.is_empty() {
+        let mut overrides = ignore::overrides::OverrideBuilder::new(target);
+        for pattern in &options.exclude {
+            let _ = overrides.add(&format!("!{pattern}"));
+        }
+        if let Ok(overrides) = overrides.build() {
+            builder.overrides(overrides);
+        }
+    }
+
     for entry in builder.build() {
         let Ok(entry) = entry else { continue };
         if entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -452,6 +468,22 @@ mod tests {
 
         let result = scan_dir(root, vec![PathBuf::from(".hidden/secret.rs")]);
         assert_eq!(result.findings.len(), 1);
+    }
+
+    #[test]
+    fn exclude_patterns_prune_subtrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/a.rs", "// TODO: keep\n");
+        write(root, "vendor/ignored.rs", "// TODO: dropped\n");
+
+        let options = ScanOptions {
+            exclude: vec!["vendor/**".into()],
+            ..Default::default()
+        };
+        let result = Scanner::new(options).unwrap().scan(root).unwrap();
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].path(), Path::new("src/a.rs"));
     }
 
     #[test]
