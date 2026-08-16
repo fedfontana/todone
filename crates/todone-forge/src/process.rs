@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn scripted_runner_records_and_serves() {
-        let mut runner = ScriptedRunner::new();
+        let runner = ScriptedRunner::new();
         runner.push(true, "out1", "");
         runner.push(false, "", "boom");
         let out = runner.run("gh", &["--version"], Some("in")).unwrap();
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn scripted_runner_fails_on_unscripted_calls() {
-        let mut runner = ScriptedRunner::new();
+        let runner = ScriptedRunner::new();
         let out = runner.run("gh", &[], None).unwrap();
         assert!(!out.success());
         assert!(out.stderr.contains("no scripted response"));
