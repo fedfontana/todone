@@ -4,12 +4,14 @@
 //! configuration, and the interactive session state machine.
 
 pub mod config;
+pub mod draft;
 pub mod language;
 pub mod matcher;
 pub mod model;
 pub mod remove;
 pub mod repo;
 pub mod scan;
+pub mod session;
 
 /// The version of the domain model. Bump on breaking changes to the public API.
 pub const CORE_VERSION: u32 = 1;

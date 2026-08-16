@@ -116,9 +116,10 @@ impl Config {
         let mut config = Self::defaults();
 
         if let Some(path) = user_config
-            && path.exists() {
-                config.merge_file(path)?;
-            }
+            && path.exists()
+        {
+            config.merge_file(path)?;
+        }
 
         let repo_path = repo_root.join("todone.toml");
         if repo_path.exists() {
@@ -172,13 +173,15 @@ impl Config {
             }
         }
         if let Some(forge) = file.forge
-            && let Some(kind) = forge.kind {
-                self.forge.kind = kind;
-            }
+            && let Some(kind) = forge.kind
+        {
+            self.forge.kind = kind;
+        }
         if let Some(editor) = file.editor
-            && let Some(command) = editor.command {
-                self.editor.command = Some(command);
-            }
+            && let Some(command) = editor.command
+        {
+            self.editor.command = Some(command);
+        }
     }
 
     /// Applies command-line overrides on top of everything else.
