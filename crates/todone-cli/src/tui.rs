@@ -79,6 +79,9 @@ pub struct PortApp {
     pub commit: String,
     /// Scroll label for the statusline, computed each frame.
     pub scroll_label: String,
+    /// Center the comment on the next frame (set on load and on finding
+    /// navigation; applied once the pane dimensions are known).
+    pub pending_center: bool,
     /// The context pane size from the last frame.
     pub pane_height: usize,
     pub pane_width: usize,
@@ -128,6 +131,7 @@ impl PortApp {
             scroll_label: "TOP".into(),
             pane_height: 0,
             pane_width: 0,
+            pending_center: true,
             sources: HashMap::new(),
             contexts: HashMap::new(),
             spans: HashMap::new(),
@@ -220,26 +224,28 @@ impl PortApp {
     /// Scrolls the context pane by `delta` rendered rows, clamped.
     fn scroll_lines(&mut self, delta: isize) {
         let max = self.max_scroll();
-        self.v_scroll = (self.v_scroll as isize + delta).clamp(0, max as isize) as usize;
+        self.v_scroll = self.v_scroll.saturating_add_signed(delta).min(max);
     }
 
-    /// Moves the cursor by `delta` findings, resetting the scroll offsets.
+    /// Moves the cursor by `delta` findings, centering on the comment on the
+    /// next frame.
     fn navigate(&mut self, delta: isize) {
         self.session.navigate(delta);
-        self.v_scroll = 0;
         self.h_scroll = 0;
+        self.pending_center = true;
     }
 
     /// Centers the viewport on the selected comment range (vim `zz`).
     fn center_comment(&mut self) {
         let (context, rows, total) = self.view(self.pane_height, self.pane_width);
+        let selection = context.selection.clone();
         let mut selected_start = None;
         let mut selected_end = 0;
         let mut y = 0;
         for (line, count) in context.lines.iter().zip(&rows) {
             let start = y;
             y += count;
-            if line.kind == LineKind::Selected {
+            if line.byte_range.start < selection.end && line.byte_range.end > selection.start {
                 selected_start.get_or_insert(start);
                 selected_end = y;
             }
@@ -353,7 +359,7 @@ impl PortApp {
                 Some(AppAction::Continue)
             }
             (KeyCode::Char('G'), _) => {
-                self.scroll_lines(isize::MAX);
+                self.v_scroll = self.max_scroll();
                 Some(AppAction::Continue)
             }
             (KeyCode::Char('z'), _) => {
@@ -486,6 +492,7 @@ impl PortApp {
     /// `--yes`).
     fn advance(&mut self) -> AppAction {
         if self.session.next_undecided() {
+            self.pending_center = true;
             return AppAction::Continue;
         }
         self.message = Some("all findings decided".into());
@@ -688,18 +695,23 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, app: &PortApp) {
 /// Converts the visible part of the context window into styled ratatui
 /// lines: only lines intersecting the viewport are built, so the per-frame
 /// cost stays proportional to the pane rather than the file.
+///
+/// Returns the lines plus the absolute row of the first built line; the
+/// caller scrolls the paragraph by `v_scroll - first_row`, so the offset is
+/// applied exactly once.
 fn context_to_lines(
     app: &mut PortApp,
     context: &Context,
     rows: &[usize],
     v_scroll: usize,
     pane_height: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize) {
+    let empty = (Vec::new(), 0);
     let Some(finding) = app.session.findings.get(app.session.cursor()).cloned() else {
-        return Vec::new();
+        return empty;
     };
     if context.lines.is_empty() {
-        return Vec::new();
+        return empty;
     }
     let selection = context.selection.clone();
     let spans = app.spans_of(&finding);
@@ -722,8 +734,9 @@ fn context_to_lines(
     let first = (0..rows.len()).find(|&i| starts[i] + rows[i] > v_scroll);
     let last = (0..rows.len()).rev().find(|&i| starts[i] < view_end);
     let (Some(first), Some(last)) = (first, last) else {
-        return Vec::new();
+        return empty;
     };
+    let first_row = starts[first];
 
     let mut out = Vec::new();
     for index in 0..=last - first {
@@ -774,7 +787,7 @@ fn context_to_lines(
         }
         out.push(Line::from(spans_line));
     }
-    out
+    (out, first_row)
 }
 
 fn render_context_area(frame: &mut ratatui::Frame, area: Rect, app: &mut PortApp) {
@@ -789,12 +802,17 @@ fn render_context_area(frame: &mut ratatui::Frame, area: Rect, app: &mut PortApp
     if app.v_scroll > max {
         app.v_scroll = max;
     }
+    if app.pending_center {
+        app.pending_center = false;
+        app.center_comment();
+    }
     app.scroll_label = app.scroll_label();
 
-    let lines = context_to_lines(app, &context, &rows, app.v_scroll, height);
+    let (lines, first_row) = context_to_lines(app, &context, &rows, app.v_scroll, height);
+    let scroll_y = app.v_scroll.saturating_sub(first_row);
     let mut paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL))
-        .scroll((app.v_scroll as u16, app.h_scroll as u16));
+        .scroll((scroll_y as u16, app.h_scroll as u16));
     if app.wrap {
         paragraph = paragraph.wrap(Wrap { trim: false });
     }
@@ -1099,6 +1117,29 @@ mod tests {
         }
     }
 
+    /// A finding whose byte range points at `needle` in `content` (the plain
+    /// `finding` helper uses a fixed range, which breaks range-sensitive
+    /// logic like centering).
+    fn finding_at(content: &str, needle: &str, line: usize) -> Finding {
+        let start = content.find(needle).expect("needle in content");
+        Finding {
+            run: CommentRun {
+                comments: vec![Comment {
+                    path: "src/a.rs".into(),
+                    line,
+                    end_line: line,
+                    column: 0,
+                    byte_range: start..start + needle.len(),
+                    text: needle.into(),
+                    language: "rust".into(),
+                }],
+            },
+            category: "TODO".into(),
+            primary: 0,
+            selection: Selection::full(1),
+        }
+    }
+
     fn ctx_for(_finding: Finding) -> (ScanContext, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -1317,7 +1358,7 @@ mod tests {
         for i in 101..=200 {
             content.push_str(&format!("line {i} {}\n", "word ".repeat(40)));
         }
-        std::fs::write(dir.path().join("src/a.rs"), content).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), &content).unwrap();
         let repo = todone_core::repo::RepoInfo {
             root: dir.path().to_path_buf(),
             commit: None,
@@ -1328,7 +1369,10 @@ mod tests {
             config: todone_core::config::Config::defaults(),
             repo,
         };
-        let mut app = PortApp::new(Session::new(vec![finding(100, 100)], "abc".into()), &ctx);
+        let mut app = PortApp::new(
+            Session::new(vec![finding_at(&content, "// TODO: x", 100)], "abc".into()),
+            &ctx,
+        );
 
         // Render once so the pane size is known.
         let backend = TestBackend::new(60, 30);
@@ -1380,7 +1424,7 @@ mod tests {
         for i in 202..=400 {
             content.push_str(&format!("after line {i}\n"));
         }
-        std::fs::write(dir.path().join("src/a.rs"), content).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), &content).unwrap();
         let repo = todone_core::repo::RepoInfo {
             root: dir.path().to_path_buf(),
             commit: None,
@@ -1446,6 +1490,204 @@ mod tests {
         ctx.config.context.tab_width = 8;
         let app = PortApp::new(Session::new(vec![finding(1, 1)], "abc".into()), &ctx);
         assert_eq!(app.tab_width, 8);
+    }
+
+    #[test]
+    fn scroll_moves_one_line_per_press() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let mut content = String::new();
+        for i in 1..=30 {
+            content.push_str(&format!("line {i}\n"));
+        }
+        content.push_str("// TODO: x\n");
+        std::fs::write(dir.path().join("src/a.rs"), &content).unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: None,
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let mut app = PortApp::new(Session::new(vec![finding(15, 15)], "abc".into()), &ctx);
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        // Draw once so the pending load-centering is consumed, then go to
+        // the top. One j press must move the view by exactly one line.
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.handle_key(key(KeyCode::Char('g')));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(first_gutter_line(terminal.backend().buffer()), 1);
+
+        app.handle_key(key(KeyCode::Char('j')));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(
+            first_gutter_line(terminal.backend().buffer()),
+            2,
+            "one j press must show line 2, not line 3"
+        );
+
+        app.handle_key(key(KeyCode::Char('k')));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(first_gutter_line(terminal.backend().buffer()), 1);
+    }
+
+    #[test]
+    fn g_is_bounded_and_does_not_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let mut content = String::new();
+        for i in 1..=60 {
+            content.push_str(&format!("line {i}\n"));
+        }
+        content.push_str("// TODO: x\n");
+        std::fs::write(dir.path().join("src/a.rs"), &content).unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: None,
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let mut app = PortApp::new(Session::new(vec![finding(30, 30)], "abc".into()), &ctx);
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        // G after scrolling must reach the bottom exactly (this used to
+        // overflow when v_scroll > 0).
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('G')));
+        let max = app.max_scroll();
+        assert_eq!(app.v_scroll, max);
+
+        // Repeated G, paging at the edges, and paging up at the top stay
+        // bounded.
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.v_scroll, max);
+        app.handle_key(ctrl(KeyCode::Char('f')));
+        assert_eq!(app.v_scroll, max);
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.v_scroll, 0);
+        app.handle_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(app.v_scroll, 0);
+    }
+
+    #[test]
+    fn comment_is_centered_on_load_and_navigation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let mut content = String::new();
+        for i in 1..=49 {
+            content.push_str(&format!("line {i}\n"));
+        }
+        content.push_str("// TODO: first\n");
+        for i in 51..=79 {
+            content.push_str(&format!("line {i}\n"));
+        }
+        content.push_str("// TODO: second\n");
+        for i in 81..=100 {
+            content.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(dir.path().join("src/a.rs"), &content).unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: None,
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let mut app = PortApp::new(
+            Session::new(
+                vec![
+                    finding_at(&content, "// TODO: first", 50),
+                    finding_at(&content, "// TODO: second", 80),
+                ],
+                "abc".into(),
+            ),
+            &ctx,
+        );
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        // On load the first comment is centered, not stuck at the top.
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (_, _, viewport) = viewport_for(&mut app);
+        assert!(app.v_scroll > 0, "the view must not open at the top");
+        assert!(
+            viewport.contains(&49),
+            "first comment row must be visible, v_scroll={}",
+            app.v_scroll
+        );
+
+        // Navigating centers the next comment.
+        app.handle_key(ctrl(KeyCode::Char('n')));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (_, _, viewport) = viewport_for(&mut app);
+        assert!(
+            viewport.contains(&79),
+            "second comment row must be visible, v_scroll={}",
+            app.v_scroll
+        );
+    }
+
+    /// The selected rows' range of the current finding, in the whole-file
+    /// layout.
+    fn viewport_for(app: &mut PortApp) -> (usize, usize, std::ops::Range<usize>) {
+        let (context, rows, _) = app.view(app.pane_height, app.pane_width);
+        let selection = context.selection.clone();
+        let mut selected_start = None;
+        let mut selected_end = 0;
+        let mut y = 0;
+        for (line, count) in context.lines.iter().zip(&rows) {
+            let start = y;
+            y += count;
+            if line.byte_range.start < selection.end && line.byte_range.end > selection.start {
+                selected_start.get_or_insert(start);
+                selected_end = y;
+            }
+        }
+        (
+            selected_start.unwrap_or(0),
+            selected_end,
+            app.v_scroll..app.v_scroll + app.pane_height,
+        )
+    }
+
+    /// The line number of the first gutter row in the buffer (skipping the
+    /// header, borders, statusline, and hints).
+    fn first_gutter_line(buffer: &ratatui::buffer::Buffer) -> usize {
+        let area = buffer.area;
+        for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            // The gutter sits between the border and the content separator:
+            // "│    3 │ line 3" -> cell 1.
+            let gutter = row.split('│').nth(1).unwrap_or("");
+            if let Some(line) = gutter
+                .split_whitespace()
+                .last()
+                .and_then(|number| number.parse::<usize>().ok())
+            {
+                return line;
+            }
+        }
+        panic!("no gutter line found in the buffer");
     }
 
     #[test]
