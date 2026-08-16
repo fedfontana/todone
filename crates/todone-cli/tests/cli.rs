@@ -140,14 +140,77 @@ fn config_prints_sample_and_effective() {
 }
 
 #[test]
-fn port_is_not_implemented_yet() {
+fn port_auto_skip_dry_run_prints_the_plan() {
     let dir = repo_fixture();
     todone()
         .current_dir(dir.path())
-        .arg("port")
+        .args(["port", "--auto", "skip", "--dry-run"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("not implemented"));
+        .success()
+        .stdout(predicate::str::contains("skip"))
+        .stdout(predicate::str::contains("src/main.rs"));
+    // Nothing was touched.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+        "fn main() {\n    // TODO: fix this\n    // FIXME: and this\n}\n"
+    );
+}
+
+#[test]
+fn port_auto_delete_removes_comments() {
+    let dir = repo_fixture();
+    todone()
+        .current_dir(dir.path())
+        .args(["port", "--auto", "delete"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deleted comment"))
+        .stdout(predicate::str::contains("done"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+        "fn main() {\n}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("lib.py")).unwrap(),
+        "def f():\n    pass\n"
+    );
+}
+
+#[test]
+fn port_auto_delete_json() {
+    let dir = repo_fixture();
+    let output = todone()
+        .current_dir(dir.path())
+        .args(["port", "--auto", "delete", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let results: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let results = results.as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(
+        results
+            .iter()
+            .all(|r| r["action"] == "delete" && r["removed"] == true)
+    );
+}
+
+#[test]
+fn port_no_findings_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+    todone()
+        .current_dir(dir.path())
+        .args(["port", "--auto", "delete"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no marker comments found"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+        "fn main() {}\n"
+    );
 }
 
 #[test]

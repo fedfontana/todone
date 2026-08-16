@@ -2,10 +2,12 @@
 
 mod cli;
 mod context;
+mod editor;
 mod highlight;
 mod render;
 mod report;
 mod run;
+mod tui;
 
 use std::io::IsTerminal;
 

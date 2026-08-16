@@ -96,8 +96,12 @@ pub enum RemoveError {
     },
 }
 
-/// Removes `selection` (a byte range) from `source`, cleaning up the
-/// affected lines.
+/// Removes the selected byte ranges (comment nodes) from `source`, cleaning
+/// up the affected lines.
+///
+/// Ranges may be disjoint (a run of comments separated by code); each is
+/// clipped to its line, lines that become empty are removed, and inline
+/// gaps are joined back together.
 ///
 /// # Examples
 ///
@@ -107,64 +111,82 @@ pub enum RemoveError {
 /// let src = "fn main() {\n    // TODO: fix this\n    let x = 1; // TODO: also this\n}\n";
 /// let first_start = src.find("// TODO: fix this").unwrap();
 /// let first = first_start..first_start + "// TODO: fix this".len();
-/// let out = remove_selection(src, &first);
+/// let out = remove_selection(src, &[first]);
 /// assert_eq!(out.content, "fn main() {\n    let x = 1; // TODO: also this\n}\n");
 ///
 /// let second_start = out.content.find("// TODO: also this").unwrap();
 /// let second = second_start..second_start + "// TODO: also this".len();
-/// let out = remove_selection(&out.content, &second);
+/// let out = remove_selection(&out.content, &[second]);
 /// assert_eq!(out.content, "fn main() {\n    let x = 1;\n}\n");
 /// ```
-pub fn remove_selection(source: &str, selection: &Range<usize>) -> RemovalOutcome {
+pub fn remove_selection(source: &str, ranges: &[Range<usize>]) -> RemovalOutcome {
     assert!(
-        selection.start <= selection.end && selection.end <= source.len(),
-        "selection {:?} out of bounds for {} bytes",
-        selection,
+        ranges
+            .iter()
+            .all(|r| r.start <= r.end && r.end <= source.len()),
+        "selection ranges out of bounds for {} bytes",
         source.len()
     );
 
-    if source.is_empty() || selection.start == selection.end {
+    let ranges = merge_ranges(ranges);
+    if source.is_empty() || ranges.is_empty() {
+        let range = ranges.first().cloned().unwrap_or(0..0);
         return RemovalOutcome {
             content: source.to_string(),
-            removed_range: selection.clone(),
+            removed_range: range,
         };
     }
 
     let mut lines = split_lines(source);
-    let (first_idx, last_idx) = line_indices(&lines, selection);
-
-    let first_start = lines[first_idx].start;
-    let last_start = lines[last_idx].start;
-
-    let before = &source[first_start..selection.start];
-    let after = &source[selection.end..last_start + lines[last_idx].text.len()];
-
     let mut removed_lines: Vec<usize> = Vec::new();
     let mut removed_last_residue_line = false;
 
-    if first_idx == last_idx {
-        let combined = format!("{before}{after}");
-        if combined.trim().is_empty() {
-            removed_lines.push(first_idx);
-            removed_last_residue_line = true;
-        } else {
-            lines[first_idx].text = inline_join(before, after);
-            lines[first_idx].text = lines[first_idx].text.trim_end().to_string();
+    // The index of the line where the last range ends; removing that line
+    // triggers blank-line collapsing afterwards.
+    let last_covered = last_line_index(&lines, ranges[ranges.len() - 1].end);
+
+    for (index, line) in lines.iter_mut().enumerate() {
+        let line_start = line.start;
+        let line_end = line_start + line.text.len();
+        // Ranges clipped to this line's text.
+        let clipped: Vec<Range<usize>> = ranges
+            .iter()
+            .filter_map(|r| {
+                let start = r.start.max(line_start).min(line_end);
+                let end = r.end.max(line_start).min(line_end);
+                (start < end).then_some(start..end)
+            })
+            .collect();
+        if clipped.is_empty() {
+            continue;
         }
-    } else {
-        if before.trim().is_empty() {
-            removed_lines.push(first_idx);
-        } else {
-            lines[first_idx].text = before.trim_end().to_string();
+
+        // Fragments of the line outside the covered ranges.
+        let mut fragments: Vec<&str> = Vec::new();
+        let mut cursor = line_start;
+        for r in &clipped {
+            if cursor < r.start {
+                fragments.push(&source[cursor..r.start]);
+            }
+            cursor = r.end;
         }
-        for idx in first_idx + 1..last_idx {
-            removed_lines.push(idx);
+        if cursor < line_end {
+            fragments.push(&source[cursor..line_end]);
         }
-        if after.trim().is_empty() {
-            removed_lines.push(last_idx);
-            removed_last_residue_line = true;
+
+        if fragments.iter().all(|f| f.trim().is_empty()) {
+            removed_lines.push(index);
+            removed_last_residue_line = index == last_covered;
         } else {
-            lines[last_idx].text = after.to_string();
+            let mut joined = String::new();
+            for fragment in &fragments {
+                joined = if joined.is_empty() {
+                    (*fragment).to_string()
+                } else {
+                    join_fragments(&joined, fragment)
+                };
+            }
+            line.text = joined.trim_end().to_string();
         }
     }
 
@@ -183,32 +205,57 @@ pub fn remove_selection(source: &str, selection: &Range<usize>) -> RemovalOutcom
 
     RemovalOutcome {
         content,
-        removed_range: selection.clone(),
+        removed_range: ranges[0].start..ranges[ranges.len() - 1].end,
     }
 }
 
-/// Joins the fragments left on a line by an inline comment removal.
+/// The index of the line containing a byte offset (the last line as a
+/// fallback).
+fn last_line_index(lines: &[LineBuf], offset: usize) -> usize {
+    lines
+        .iter()
+        .position(|line| offset <= line.start + line.len())
+        .unwrap_or(lines.len().saturating_sub(1))
+}
+
+/// Sorts and merges overlapping or adjacent ranges.
+fn merge_ranges(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut ranges: Vec<Range<usize>> = ranges.to_vec();
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => {
+                last.end = last.end.max(range.end);
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+/// Joins two fragments of a line left by a comment removal.
 ///
-/// A space is inserted only where both fragments look like they belong to
-/// distinct tokens: `let x = 1; // TODO` → `let x = 1;`. When the cut sits
-/// inside brackets (`x(/* TODO */);`) the fragments are joined directly, so
-/// the result is `x();` rather than `x( );`.
-fn inline_join(before: &str, after: &str) -> String {
+/// - An empty first fragment keeps the second as-is (the comment started at
+///   the line start, so indentation is preserved).
+/// - An empty second fragment trims the first (trailing comment).
+/// - Otherwise a space is inserted, except when the cut sits inside
+///   brackets (`x(/* TODO */);` → `x();`).
+fn join_fragments(before: &str, after: &str) -> String {
+    if before.trim().is_empty() {
+        return after.to_string();
+    }
+    if after.trim().is_empty() {
+        return before.trim_end().to_string();
+    }
     let before = before.trim_end();
     let after = after.trim_start();
-    match (before.is_empty(), after.is_empty()) {
-        (true, true) => String::new(),
-        (true, false) => after.to_string(),
-        (false, true) => before.to_string(),
-        (false, false) => {
-            let inside_brackets = matches!(before.chars().last(), Some('(' | '[' | '{' | ','))
-                && matches!(after.chars().next(), Some(')' | ']' | '}' | ',' | ';'));
-            if inside_brackets {
-                format!("{before}{after}")
-            } else {
-                format!("{before} {after}")
-            }
-        }
+    let inside_brackets = matches!(before.chars().last(), Some('(' | '[' | '{' | ','))
+        && matches!(after.chars().next(), Some(')' | ']' | '}' | ',' | ';'));
+    if inside_brackets {
+        format!("{before}{after}")
+    } else {
+        format!("{before} {after}")
     }
 }
 
@@ -273,19 +320,6 @@ fn split_lines(source: &str) -> Vec<LineBuf> {
     lines
 }
 
-/// Maps the selection's byte offsets to first and last line indices.
-fn line_indices(lines: &[LineBuf], selection: &Range<usize>) -> (usize, usize) {
-    let first = lines
-        .iter()
-        .position(|line| selection.start < line.start + line.len())
-        .unwrap_or(lines.len() - 1);
-    let last = lines
-        .iter()
-        .position(|line| selection.end <= line.start + line.len())
-        .unwrap_or(lines.len() - 1);
-    (first, last)
-}
-
 /// Removes the selection from the file on disk, verifying the file still
 /// matches `expected` first.
 ///
@@ -299,7 +333,7 @@ fn line_indices(lines: &[LineBuf], selection: &Range<usize>) -> (usize, usize) {
 /// read/write errors as [`RemoveError::Read`]/[`RemoveError::Write`].
 pub fn apply_removal(
     path: &Path,
-    selection: &Range<usize>,
+    ranges: &[Range<usize>],
     expected: &FileSnapshot,
 ) -> Result<RemovalOutcome, RemoveError> {
     let bytes = std::fs::read(path).map_err(|source| RemoveError::Read {
@@ -314,13 +348,16 @@ pub fn apply_removal(
     let source = std::str::from_utf8(&bytes).map_err(|_| RemoveError::Changed {
         path: path.to_path_buf(),
     })?;
-    if selection.start > selection.end || selection.end > source.len() {
+    if let Some(range) = ranges
+        .iter()
+        .find(|r| r.start > r.end || r.end > source.len())
+    {
         return Err(RemoveError::OutOfBounds {
-            range: selection.clone(),
+            range: range.clone(),
             len: source.len(),
         });
     }
-    let outcome = remove_selection(source, selection);
+    let outcome = remove_selection(source, ranges);
     atomic_write(path, outcome.content.as_bytes()).map_err(|source| RemoveError::Write {
         path: path.to_path_buf(),
         source,
@@ -349,7 +386,7 @@ mod tests {
     }
 
     fn remove(src: &str, needle: &str) -> String {
-        let out = remove_selection(src, &range(src, needle));
+        let out = remove_selection(src, &[range(src, needle)]);
         // Removing again is always safe: the outcome must still be valid
         // input for a removal of the same range.
         assert!(out.removed_range == range(src, needle));
@@ -427,18 +464,49 @@ mod tests {
     }
 
     #[test]
+    fn run_ending_in_a_trailing_comment_keeps_the_code() {
+        let src = "// TODO: a\n// TODO: b\nlet x = 1; // TODO: c\n";
+        // The run groups all three comment lines; removing the comment
+        // nodes must keep the code that precedes the trailing comment.
+        let a = range(src, "// TODO: a\n");
+        let b = range(src, "// TODO: b\n");
+        let c = range(src, "// TODO: c");
+        let out = remove_selection(src, &[a, b, c]);
+        assert_eq!(out.content, "let x = 1;\n");
+    }
+
+    #[test]
+    fn run_starting_with_an_inline_comment_keeps_the_first_line_code() {
+        let src = "let x = 1; // TODO: a\n// TODO: b\n}\n";
+        let a = range(src, "// TODO: a");
+        let b = range(src, "// TODO: b\n");
+        let out = remove_selection(src, &[a, b]);
+        assert_eq!(out.content, "let x = 1;\n}\n");
+    }
+
+    #[test]
+    fn disjoint_ranges_on_one_line_are_joined() {
+        let src = "let a = 1; // TODO: a\nlet b = 2; // TODO: b\n";
+        let a = range(src, "// TODO: a");
+        let b = range(src, "// TODO: b");
+        let out = remove_selection(src, &[a, b]);
+        assert_eq!(out.content, "let a = 1;\nlet b = 2;\n");
+    }
+
+    #[test]
     fn subset_selection_keeps_the_rest() {
         let src = "// TODO: a\n// keep me\ncode\n";
         // Select only the first comment.
         let range = range(src, "// TODO: a");
-        let out = remove_selection(src, &range);
+        let out = remove_selection(src, &[range]);
         assert_eq!(out.content, "// keep me\ncode\n");
     }
 
     #[test]
     fn empty_selection_is_a_no_op() {
         let src = "// TODO: x\ncode\n";
-        let out = remove_selection(src, &(0..0));
+        let ranges = std::slice::from_ref(&(0..0));
+        let out = remove_selection(src, ranges);
         assert_eq!(out.content, src);
     }
 
@@ -449,8 +517,12 @@ mod tests {
         std::fs::write(&path, "// TODO: x\ncode\n").unwrap();
         let snapshot = FileSnapshot::capture(&path).unwrap();
 
-        let outcome =
-            apply_removal(&path, &range("// TODO: x\ncode\n", "// TODO: x"), &snapshot).unwrap();
+        let outcome = apply_removal(
+            &path,
+            &[range("// TODO: x\ncode\n", "// TODO: x")],
+            &snapshot,
+        )
+        .unwrap();
         assert_eq!(outcome.content, "code\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "code\n");
     }
@@ -463,7 +535,8 @@ mod tests {
         let snapshot = FileSnapshot::capture(&path).unwrap();
 
         std::fs::write(&path, "// TODO: x\nchanged!\n").unwrap();
-        let err = apply_removal(&path, &(0..10), &snapshot).unwrap_err();
+        let ranges = std::slice::from_ref(&(0..10));
+        let err = apply_removal(&path, ranges, &snapshot).unwrap_err();
         assert!(matches!(err, RemoveError::Changed { .. }));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -477,7 +550,8 @@ mod tests {
         let path = dir.path().join("a.rs");
         std::fs::write(&path, "code\n").unwrap();
         let snapshot = FileSnapshot::capture(&path).unwrap();
-        let err = apply_removal(&path, &(5..9), &snapshot).unwrap_err();
+        let ranges = std::slice::from_ref(&(5..9));
+        let err = apply_removal(&path, ranges, &snapshot).unwrap_err();
         assert!(matches!(err, RemoveError::OutOfBounds { .. }));
     }
 
