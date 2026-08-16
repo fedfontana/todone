@@ -124,6 +124,18 @@ todone config        # effective configuration as TOML
 todone config --sample
 ```
 
+### `todone completions`
+
+Generate shell completion scripts (bash, elvish, fish, powershell, zsh):
+
+```
+todone completions bash > /etc/bash_completion.d/todone
+todone completions zsh > "${fpath[1]}/_todone"
+```
+
+Path-taking arguments (`[PATH]...`, `--editor`) carry value hints so
+shells can complete files and commands.
+
 ## Configuration
 
 Layered, lowest to highest precedence:

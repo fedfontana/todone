@@ -536,3 +536,38 @@ fn port_skips_non_utf8_files() {
         .success()
         .stdout(predicate::str::contains("no marker comments found"));
 }
+
+#[test]
+fn completions_generate_for_shells() {
+    let output = todone()
+        .arg("completions")
+        .arg("bash")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.is_empty());
+    assert!(text.contains("todone"));
+
+    let output = todone()
+        .arg("completions")
+        .arg("zsh")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("#compdef"));
+}
+
+#[test]
+fn completions_reject_unknown_shells() {
+    todone()
+        .args(["completions", "frobnicate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value"));
+}

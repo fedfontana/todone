@@ -29,6 +29,8 @@ pub enum Command {
     Port(PortArgs),
     /// Show the effective configuration or a sample.
     Config(ConfigArgs),
+    /// Generate shell completion scripts.
+    Completions(CompletionsArgs),
 }
 
 /// Shared options for scanning behavior.
@@ -60,7 +62,7 @@ pub struct CommonScanArgs {
     #[arg(long)]
     pub max_file_bytes: Option<usize>,
     /// Files or directories to scan; empty means the whole repo.
-    #[arg(value_name = "PATH")]
+    #[arg(value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
     pub paths: Vec<PathBuf>,
 }
 
@@ -87,8 +89,16 @@ pub struct PortArgs {
     #[arg(long)]
     pub forge: Option<String>,
     /// Editor command for drafts and read-only views.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::CommandName)]
     pub editor: Option<String>,
+}
+
+/// Arguments for the `completions` subcommand.
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// The shell to generate completions for.
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
 }
 
 /// Decision applied to every finding in `--auto` mode.

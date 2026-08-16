@@ -50,6 +50,7 @@ fn run(cli: Cli, out: &mut dyn std::io::Write, color: bool) -> anyhow::Result<()
             run::port::run_port(out, &context, &args, cli.json, color)
         }
         Command::Config(args) => run::config::run_config(out, &args),
+        Command::Completions(args) => run::completions::run_completions(out, &args),
     }
 }
 
@@ -89,5 +90,24 @@ mod tests {
         assert!(!resolve_color(false, true, true));
         assert!(!resolve_color(false, false, false));
         assert!(resolve_color(false, false, true));
+    }
+
+    #[test]
+    fn path_args_carry_value_hints() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let scan = command.find_subcommand("scan").unwrap();
+        let paths = scan
+            .get_arguments()
+            .find(|arg| arg.get_id() == "paths")
+            .unwrap();
+        assert_eq!(paths.get_value_hint(), clap::ValueHint::AnyPath);
+
+        let port = command.find_subcommand("port").unwrap();
+        let editor = port
+            .get_arguments()
+            .find(|arg| arg.get_id() == "editor")
+            .unwrap();
+        assert_eq!(editor.get_value_hint(), clap::ValueHint::CommandName);
     }
 }
