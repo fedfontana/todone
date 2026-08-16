@@ -6,6 +6,7 @@
 pub mod language;
 pub mod matcher;
 pub mod model;
+pub mod remove;
 pub mod repo;
 pub mod scan;
 

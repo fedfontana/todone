@@ -136,6 +136,33 @@ impl Finding {
     pub fn line(&self) -> usize {
         self.run.comments[self.primary].line
     }
+
+    /// Grows the selection by one comment, preferring to extend the end and
+    /// falling back to the start. Never exceeds the run.
+    pub fn grow_selection(&mut self) {
+        let len = self.run.comments.len();
+        if self.selection.end + 1 < len {
+            self.selection.end += 1;
+        } else if self.selection.start > 0 {
+            self.selection.start -= 1;
+        }
+    }
+
+    /// Shrinks the selection by one comment, from the side away from the
+    /// primary comment, which always stays selected.
+    pub fn shrink_selection(&mut self) {
+        let primary = self.primary;
+        if self.selection.start < primary {
+            self.selection.start += 1;
+        } else if self.selection.end > primary {
+            self.selection.end -= 1;
+        }
+    }
+
+    /// Restores the selection to the full run.
+    pub fn reset_selection(&mut self) {
+        self.selection = Selection::full(self.run.comments.len());
+    }
 }
 
 #[cfg(test)]
@@ -201,5 +228,45 @@ mod tests {
         assert_eq!(finding.path(), PathBuf::from("src/lib.rs"));
         assert_eq!(finding.line(), 1);
         assert_eq!(finding.selected_range(), 0..10);
+    }
+
+    #[test]
+    fn selection_grow_shrink_and_reset() {
+        let run = CommentRun {
+            comments: vec![comment(0, 10), comment(11, 20), comment(21, 30)],
+        };
+        let mut finding = Finding {
+            run: run.clone(),
+            category: "TODO".into(),
+            primary: 1,
+            selection: Selection { start: 0, end: 2 },
+        };
+
+        // Growing past the end moves the start instead.
+        finding.grow_selection();
+        assert_eq!((finding.selection.start, finding.selection.end), (0, 2));
+
+        // Shrink from the side away from the primary.
+        finding.shrink_selection();
+        assert_eq!((finding.selection.start, finding.selection.end), (1, 2));
+        finding.shrink_selection();
+        assert_eq!((finding.selection.start, finding.selection.end), (1, 1));
+
+        // The primary always stays selected.
+        finding.shrink_selection();
+        assert_eq!((finding.selection.start, finding.selection.end), (1, 1));
+
+        // A smaller run grows the end first.
+        let mut finding = Finding {
+            run,
+            category: "TODO".into(),
+            primary: 0,
+            selection: Selection { start: 0, end: 0 },
+        };
+        finding.grow_selection();
+        assert_eq!((finding.selection.start, finding.selection.end), (0, 1));
+
+        finding.reset_selection();
+        assert_eq!((finding.selection.start, finding.selection.end), (0, 2));
     }
 }
