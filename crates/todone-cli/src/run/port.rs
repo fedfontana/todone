@@ -80,6 +80,7 @@ pub fn run_port(
     let forge = todone_forge::forge::from_config(
         &context.config.forge,
         Box::new(todone_forge::process::SystemProcessRunner),
+        Some(context.repo.root.clone()),
     )?;
     let results = execute(&app.session, forge.as_ref(), &snapshots, &context.repo.root);
     print_execution(out, &app.session, &results, json)
@@ -380,8 +381,11 @@ mod tests {
             r#"{"number": 7, "url": "https://github.com/o/r/issues/7"}"#,
             "",
         );
-        let forge =
-            todone_forge::forge::GitHubForge::new(Box::new(runner.clone()), Some("o/r".into()));
+        let forge = todone_forge::forge::GitHubForge::new(
+            Box::new(runner.clone()),
+            Some("o/r".into()),
+            None,
+        );
 
         let results = execute(&session, &forge, &snaps, root);
         assert_eq!(results.len(), 1);
@@ -413,8 +417,11 @@ mod tests {
 
         let runner = ScriptedRunner::new();
         runner.push(false, "", "gh: not authenticated");
-        let forge =
-            todone_forge::forge::GitHubForge::new(Box::new(runner.clone()), Some("o/r".into()));
+        let forge = todone_forge::forge::GitHubForge::new(
+            Box::new(runner.clone()),
+            Some("o/r".into()),
+            None,
+        );
 
         let results = execute(&session, &forge, &snaps, root);
         let result = &results[0];
@@ -446,8 +453,11 @@ mod tests {
 
         let runner = ScriptedRunner::new();
         runner.push(true, r#"{"number": 9, "url": "https://x/9"}"#, "");
-        let forge =
-            todone_forge::forge::GitHubForge::new(Box::new(runner.clone()), Some("o/r".into()));
+        let forge = todone_forge::forge::GitHubForge::new(
+            Box::new(runner.clone()),
+            Some("o/r".into()),
+            None,
+        );
 
         // The file changes after the snapshot: the removal must be refused.
         std::fs::write(root.join("a.rs"), "// TODO: fix\nchanged by the user\n").unwrap();
@@ -475,8 +485,11 @@ mod tests {
         let snaps = snapshots(root, &session);
 
         let runner = ScriptedRunner::new();
-        let forge =
-            todone_forge::forge::GitHubForge::new(Box::new(runner.clone()), Some("o/r".into()));
+        let forge = todone_forge::forge::GitHubForge::new(
+            Box::new(runner.clone()),
+            Some("o/r".into()),
+            None,
+        );
         let results = execute(&session, &forge, &snaps, root);
         assert_eq!(results[0].action, "delete");
         assert!(results[0].removed);
@@ -495,8 +508,11 @@ mod tests {
         let snaps = snapshots(root, &session);
 
         let runner = ScriptedRunner::new();
-        let forge =
-            todone_forge::forge::GitHubForge::new(Box::new(runner.clone()), Some("o/r".into()));
+        let forge = todone_forge::forge::GitHubForge::new(
+            Box::new(runner.clone()),
+            Some("o/r".into()),
+            None,
+        );
         let results = execute(&session, &forge, &snaps, root);
         assert_eq!(results[0].action, "skip");
         assert!(!results[0].removed);

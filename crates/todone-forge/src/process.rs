@@ -6,6 +6,7 @@
 //! seam that disappears.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// The outcome of running a process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,9 @@ impl ProcessOutput {
 
 /// Something that can run a program, capturing its output.
 ///
+/// `cwd` selects the working directory of the process, so commands can be
+/// run against a specific repository.
+///
 /// # Examples
 ///
 /// ```
@@ -36,18 +40,21 @@ impl ProcessOutput {
 ///
 /// struct Noop;
 /// impl ProcessRunner for Noop {
-///     fn run(&self, _program: &str, _args: &[&str], _input: Option<&str>) -> Result<ProcessOutput, std::io::Error> {
+///     fn run(&self, _program: &str, _args: &[&str], _input: Option<&str>, _cwd: Option<&std::path::Path>) -> Result<ProcessOutput, std::io::Error> {
 ///         Ok(ProcessOutput { success: true, code: Some(0), stdout: String::new(), stderr: String::new() })
 ///     }
 /// }
 /// ```
 pub trait ProcessRunner {
-    /// Runs `program` with `args`, writing `input` to its stdin when given.
+    /// Runs `program` with `args`, writing `input` to its stdin when given,
+    /// from working directory `cwd` (the process's own directory when
+    /// `None`).
     fn run(
         &self,
         program: &str,
         args: &[&str],
         input: Option<&str>,
+        cwd: Option<&Path>,
     ) -> Result<ProcessOutput, std::io::Error>;
 }
 
@@ -61,6 +68,7 @@ impl ProcessRunner for SystemProcessRunner {
         program: &str,
         args: &[&str],
         input: Option<&str>,
+        cwd: Option<&Path>,
     ) -> Result<ProcessOutput, std::io::Error> {
         let mut command = std::process::Command::new(program);
         command
@@ -68,6 +76,9 @@ impl ProcessRunner for SystemProcessRunner {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
         let mut child = command.spawn()?;
         if let Some(input) = input {
             use std::io::Write;
@@ -96,6 +107,8 @@ pub struct Call {
     pub args: Vec<String>,
     /// The stdin payload, when any.
     pub stdin: Option<String>,
+    /// The working directory the process ran in.
+    pub cwd: Option<PathBuf>,
 }
 
 impl fmt::Display for Call {
@@ -154,12 +167,14 @@ impl ProcessRunner for ScriptedRunner {
         program: &str,
         args: &[&str],
         input: Option<&str>,
+        cwd: Option<&Path>,
     ) -> Result<ProcessOutput, std::io::Error> {
         let mut inner = self.inner.borrow_mut();
         inner.calls.push(Call {
             program: program.to_string(),
             args: args.iter().map(|a| a.to_string()).collect(),
             stdin: input.map(str::to_string),
+            cwd: cwd.map(Path::to_path_buf),
         });
         Ok(inner
             .responses
@@ -180,7 +195,7 @@ mod tests {
     #[test]
     fn system_runner_runs_echo() {
         let runner = SystemProcessRunner;
-        let out = runner.run("echo", &["hello"], None).unwrap();
+        let out = runner.run("echo", &["hello"], None, None).unwrap();
         assert!(out.success());
         assert_eq!(out.stdout.trim(), "hello");
     }
@@ -188,7 +203,7 @@ mod tests {
     #[test]
     fn system_runner_reports_failures() {
         let runner = SystemProcessRunner;
-        let out = runner.run("sh", &["-c", "exit 3"], None).unwrap();
+        let out = runner.run("sh", &["-c", "exit 3"], None, None).unwrap();
         assert!(!out.success());
         assert_eq!(out.code, Some(3));
     }
@@ -198,10 +213,10 @@ mod tests {
         let runner = ScriptedRunner::new();
         runner.push(true, "out1", "");
         runner.push(false, "", "boom");
-        let out = runner.run("gh", &["--version"], Some("in")).unwrap();
+        let out = runner.run("gh", &["--version"], Some("in"), None).unwrap();
         assert!(out.success());
         assert_eq!(out.stdout, "out1");
-        let out = runner.run("gh", &["--version"], None).unwrap();
+        let out = runner.run("gh", &["--version"], None, None).unwrap();
         assert!(!out.success());
         assert_eq!(out.stderr, "boom");
 
@@ -215,8 +230,17 @@ mod tests {
     #[test]
     fn scripted_runner_fails_on_unscripted_calls() {
         let runner = ScriptedRunner::new();
-        let out = runner.run("gh", &[], None).unwrap();
+        let out = runner.run("gh", &[], None, None).unwrap();
         assert!(!out.success());
         assert!(out.stderr.contains("no scripted response"));
+    }
+
+    #[test]
+    fn system_runner_reports_spawn_failures() {
+        let runner = SystemProcessRunner;
+        let err = runner
+            .run("definitely-not-a-real-program-todone", &[], None, None)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }
