@@ -193,11 +193,8 @@ impl Config {
         if let Some(case_sensitive) = overrides.case_sensitive {
             self.scan.match_config.case_sensitive = case_sensitive;
         }
-        if let Some(require_space_before) = overrides.require_space_before {
-            self.scan.match_config.require_space_before = require_space_before;
-        }
-        if let Some(require_colon) = overrides.require_colon {
-            self.scan.match_config.require_colon = require_colon;
+        if let Some(pattern) = &overrides.match_pattern {
+            self.scan.match_config.pattern = Some(pattern.clone());
         }
         if let Some(paths) = &overrides.paths {
             self.scan.paths = paths.clone();
@@ -278,10 +275,17 @@ const SAMPLE_CONFIG: &str = r#"# todone configuration. Place this file at the
 categories = ["TODO", "FIXME"]
 # Match categories case-insensitively ("todo" matches "TODO").
 case_sensitive = false
-# Require a space before the category: "// TODO" matches, "//TODO" does not.
-require_space_before = true
-# Require a colon after the category: only "// TODO: x" matches.
-require_colon = false
+
+# A custom comment pattern (regex-crate syntax) with placeholders:
+#   {comment}  the comment marker (a run of non-word characters: //, ///,
+#              #, /*, " * " decorations, ...)
+#   {marker}   any configured category (captured)
+#   {content}  the rest of the line (captured)
+# Everything else is matched verbatim. Without a pattern, a built-in rule
+# requires the marker to be the first content token of a comment line, so
+# doc comments that merely mention a marker ("/// Triage TODO comments")
+# are not reported. Anchor custom patterns with ^ to keep that behavior.
+# pattern = "^{comment}{marker}:{content}"
 
 # Default scope when no paths are given on the command line.
 # paths = ["src"]
@@ -397,10 +401,8 @@ pub struct CliOverrides {
     pub categories: Option<Vec<String>>,
     /// `--case-sensitive` / `--no-case-sensitive`.
     pub case_sensitive: Option<bool>,
-    /// `--require-space` / `--no-space`.
-    pub require_space_before: Option<bool>,
-    /// `--require-colon` / `--no-colon`.
-    pub require_colon: Option<bool>,
+    /// `--match-pattern` custom comment pattern.
+    pub match_pattern: Option<String>,
     /// Positional scope paths.
     pub paths: Option<Vec<PathBuf>>,
     /// `--exclude` patterns.
@@ -529,14 +531,14 @@ mod tests {
     fn partial_match_section_keeps_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write_config(root, "todone.toml", "[scan.match]\nrequire_colon = true\n");
+        write_config(root, "todone.toml", "[scan.match]\ncase_sensitive = true\n");
         let config = Config::load(root, None, &CliOverrides::default()).unwrap();
-        assert!(config.scan.match_config.require_colon);
+        assert!(config.scan.match_config.case_sensitive);
         assert_eq!(
             config.scan.match_config.categories,
             MatchConfig::default().categories
         );
-        assert!(config.scan.match_config.require_space_before);
+        assert_eq!(config.scan.match_config.pattern, None);
     }
 
     #[test]

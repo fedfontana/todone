@@ -113,11 +113,57 @@ fn scan_with_custom_pattern_flags() {
     let dir = repo_fixture();
     todone()
         .current_dir(dir.path())
-        .args(["scan", "--pattern", "FIXME", "--no-space"])
+        .args(["scan", "--pattern", "FIXME"])
         .assert()
         .success()
         .stdout(predicate::str::contains("src/main.rs:3: FIXME"))
         .stdout(predicate::str::contains(": TODO").not());
+}
+
+#[test]
+fn scan_anchored_default_ignores_doc_mentions() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("a.rs"),
+        "/// Triage TODO comments: scan, review, and port them.\n// TODO: the real one\nfn main() {}\n",
+    )
+    .unwrap();
+    todone()
+        .current_dir(dir.path())
+        .arg("scan")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("a.rs:2: TODO"))
+        .stdout(predicate::str::contains("a.rs:1: TODO").not());
+}
+
+#[test]
+fn scan_with_custom_match_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("a.rs"),
+        "/// Triage TODO comments: scan.\n// TODO: the real one\n// TODO without colon\nfn main() {}\n",
+    )
+    .unwrap();
+    todone()
+        .current_dir(dir.path())
+        .args(["scan", "--match-pattern", "^{comment}{marker}:{content}"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("a.rs:2: TODO"))
+        .stdout(predicate::str::contains("a.rs:1: TODO").not())
+        .stdout(predicate::str::contains("a.rs:3: TODO").not());
+}
+
+#[test]
+fn scan_rejects_invalid_match_pattern() {
+    let dir = repo_fixture();
+    todone()
+        .current_dir(dir.path())
+        .args(["scan", "--match-pattern", "{comment}{marker}:{nope}"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown placeholder"));
 }
 
 #[test]

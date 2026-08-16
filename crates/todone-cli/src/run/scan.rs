@@ -21,8 +21,7 @@ pub fn overrides(args: &CommonScanArgs) -> CliOverrides {
             .as_deref()
             .map(|p| p.split(',').map(str::trim).map(str::to_string).collect()),
         case_sensitive: flag(args.case_sensitive, args.no_case_sensitive),
-        require_space_before: flag(args.require_space, args.no_space),
-        require_colon: flag(args.require_colon, args.no_colon),
+        match_pattern: args.match_pattern.clone(),
         paths: (!args.paths.is_empty()).then(|| args.paths.clone()),
         exclude: (!args.exclude.is_empty()).then(|| args.exclude.clone()),
         max_file_bytes: args.max_file_bytes,

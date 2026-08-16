@@ -49,18 +49,10 @@ pub struct CommonScanArgs {
     /// Match categories case-insensitively (default).
     #[arg(long, conflicts_with = "case_sensitive")]
     pub no_case_sensitive: bool,
-    /// Require whitespace before the category (default).
-    #[arg(long, conflicts_with = "no_space")]
-    pub require_space: bool,
-    /// Allow categories without a preceding space, e.g. `//TODO`.
-    #[arg(long, conflicts_with = "require_space")]
-    pub no_space: bool,
-    /// Require a colon after the category (`// TODO: x`).
-    #[arg(long, conflicts_with = "no_colon")]
-    pub require_colon: bool,
-    /// Do not require a colon after the category (default).
-    #[arg(long, conflicts_with = "require_colon")]
-    pub no_colon: bool,
+    /// Custom comment pattern (regex-crate syntax) with {comment}, {marker},
+    /// and {content} placeholders.
+    #[arg(long)]
+    pub match_pattern: Option<String>,
     /// Glob patterns to exclude, relative to the repo root.
     #[arg(long)]
     pub exclude: Vec<String>,

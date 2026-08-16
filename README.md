@@ -48,7 +48,8 @@ context, like `grep -A/-B`:
 ```
 todone scan                      # whole repo
 todone scan src/ tests/          # only these paths
-todone scan -A 1 -B 2 --pattern "TODO,FIXME,PERF" --no-space
+todone scan -A 1 -B 2 --pattern "TODO,FIXME,PERF"
+todone scan --match-pattern '^{comment}{marker}:{content}'
 todone scan --json               # machine-readable report
 ```
 
@@ -136,9 +137,19 @@ Layered, lowest to highest precedence:
 ```toml
 [scan.match]
 categories = ["TODO", "FIXME"]   # priority order
-case_sensitive = false           # "todo" matches "TODO"
-require_space_before = true      # "// TODO" yes, "//TODO" no
-require_colon = false            # require the ":" after the category
+case_sensitive = false           # "todo" matches "TODO" ({marker} only)
+
+# Custom comment pattern (regex-crate syntax) with placeholders:
+#   {comment}  the comment marker (a run of non-word characters: //, ///,
+#              #, /*, " * " decorations, ...)
+#   {marker}   any configured category (captured; case-insensitive per
+#              the setting above)
+#   {content}  the rest of the line (captured)
+# Everything else is matched verbatim. Without a pattern, a built-in rule
+# requires the marker to be the first content token of a comment line, so
+# doc comments that merely mention a marker are not reported.
+# Anchor custom patterns with ^ to keep that behavior.
+# pattern = "^{comment}{marker}:{content}"
 
 # paths = ["src"]                # default scope when none given on the CLI
 # exclude = ["vendor/**"]        # glob patterns to skip

@@ -1,13 +1,14 @@
 //! Category matching for comment text.
 //!
 //! A [`MatchConfig`] describes which marker categories a comment must
-//! contain for the scanner to report it, plus the strictness of the match
-//! (case sensitivity, whether a space must precede the category, and
-//! whether the category must be followed by a colon).
+//! contain for the scanner to report it. Matching is compiled into a
+//! [`Matcher`]: either the built-in default (the category must be the first
+//! content token of a comment line) or a user-supplied pattern in
+//! regex-crate syntax with `{comment}`, `{marker}`, and `{content}`
+//! placeholders.
 //!
 //! Matching runs against the *text of a comment node* — including its
-//! marker (`//`, `#`, ...). A space requirement therefore also governs
-//! `//TODO` versus `// TODO`.
+//! marker (`//`, `#`, ...).
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -18,26 +19,28 @@ pub fn default_categories() -> Vec<String> {
     vec!["TODO".to_string(), "FIXME".to_string()]
 }
 
-const fn default_true() -> bool {
-    true
-}
+/// The built-in pattern: the marker must be the first content token of a
+/// comment line (the leading run of non-word characters — `//`, `///`, `#`,
+/// `/*`, ` * ` decorations — may precede it). The suffix keeps `TODOS`
+/// from matching `TODO`.
+const DEFAULT_PATTERN: &str = r"(?m)^{comment}{marker}(?::|!|\(|\s|$)";
 
 /// Configuration for which comments count as marker comments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MatchConfig {
     /// Category names to look for, e.g. `["TODO", "FIXME"]`. At least one
-    /// non-empty entry is required; categories are tested in order.
+    /// non-empty entry is required.
     pub categories: Vec<String>,
-    /// If `false` (default), categories match case-insensitively.
+    /// If `false` (default), categories match case-insensitively. This only
+    /// affects the `{marker}` placeholder; the rest of a custom pattern is
+    /// used verbatim.
     pub case_sensitive: bool,
-    /// If `true` (default), the category must be preceded by whitespace (or
-    /// the start of the comment), so `//TODO` does not match but
-    /// `// TODO` does.
-    pub require_space_before: bool,
-    /// If `true`, the category must be followed by a colon
-    /// (`// TODO: x`), not just whitespace.
-    pub require_colon: bool,
+    /// A custom comment pattern in regex-crate syntax. The placeholders
+    /// `{comment}`, `{marker}`, and `{content}` are substituted (see
+    /// [`Matcher`]); everything else is matched verbatim against the comment
+    /// text. When unset, the built-in pattern is used.
+    pub pattern: Option<String>,
 }
 
 impl Default for MatchConfig {
@@ -45,8 +48,7 @@ impl Default for MatchConfig {
         Self {
             categories: default_categories(),
             case_sensitive: false,
-            require_space_before: default_true(),
-            require_colon: false,
+            pattern: None,
         }
     }
 }
@@ -57,9 +59,11 @@ impl MatchConfig {
     /// # Errors
     ///
     /// Returns [`MatchConfigError::NoCategories`] when the category list is
-    /// empty, [`MatchConfigError::EmptyCategory`] when an entry is blank, and
-    /// [`MatchConfigError::Regex`] if a generated expression fails to
-    /// compile (cannot happen with escaped input, but kept for completeness).
+    /// empty, [`MatchConfigError::EmptyCategory`] when an entry is blank,
+    /// [`MatchConfigError::MissingMarkerPlaceholder`] when a custom pattern
+    /// has no `{marker}`, [`MatchConfigError::UnknownPlaceholder`] when it
+    /// uses an unknown placeholder, and [`MatchConfigError::Regex`] when the
+    /// expanded pattern fails to compile.
     ///
     /// # Examples
     ///
@@ -83,37 +87,32 @@ impl MatchConfig {
             return Err(MatchConfigError::EmptyCategory);
         }
 
-        let flags = if self.case_sensitive { "" } else { "(?i)" };
-        let prefix = if self.require_space_before {
-            r"(?:\s|^)"
-        } else {
-            r"(?:\b|^)"
-        };
-        let suffix = if self.require_colon {
-            r"\s*:"
-        } else {
-            r"(?::|!|\(|\s|$)"
-        };
-
         let mut alternation = String::new();
-        let mut per_category = Vec::with_capacity(self.categories.len());
         for category in &self.categories {
-            let escaped = regex::escape(category);
             if !alternation.is_empty() {
                 alternation.push('|');
             }
-            alternation.push_str(&escaped);
-            per_category.push(Regex::new(&format!(
-                "(?m){flags}{prefix}{escaped}{suffix}"
-            ))?);
+            alternation.push_str(&regex::escape(category));
         }
+        let marker = if self.case_sensitive {
+            format!("(?<marker>{alternation})")
+        } else {
+            format!("(?<marker>(?i:{alternation}))")
+        };
 
-        let combined = Regex::new(&format!("(?m){flags}{prefix}(?:{alternation}){suffix}"))?;
-
-        Ok(Matcher {
+        let pattern = self.pattern.as_deref().unwrap_or(DEFAULT_PATTERN);
+        let expanded = substitute_placeholders(pattern, &marker)?;
+        if !expanded.contains("(?<marker>") {
+            return Err(MatchConfigError::MissingMarkerPlaceholder);
+        }
+        let regex = Regex::new(&expanded)?;
+        let compiled = CompiledPattern {
             categories: self.categories.clone(),
-            combined,
-            per_category,
+            regex,
+        };
+        Ok(match self.pattern {
+            Some(_) => Matcher::Custom(compiled),
+            None => Matcher::Default(compiled),
         })
     }
 }
@@ -127,22 +126,38 @@ pub enum MatchConfigError {
     /// A category entry is blank.
     #[error("categories must not be empty")]
     EmptyCategory,
-    /// A generated regular expression failed to compile.
+    /// A custom pattern uses an unknown placeholder.
+    #[error(
+        "unknown placeholder {{{0}}} in pattern; supported placeholders are \
+         {{comment}}, {{marker}}, and {{content}}"
+    )]
+    UnknownPlaceholder(String),
+    /// A custom pattern has no `{marker}` placeholder, so the category
+    /// cannot be determined.
+    #[error("custom pattern must contain the {{marker}} placeholder")]
+    MissingMarkerPlaceholder,
+    /// The expanded pattern failed to compile.
     #[error("failed to compile category regex: {0}")]
     Regex(#[from] regex::Error),
 }
 
 /// A compiled [`MatchConfig`], cheap to match against comment text.
+///
+/// Both variants resolve the matched category from the `marker` capture
+/// group and normalize it back to the configured spelling (so `// todo: x`
+/// reports `TODO` when matching case-insensitively).
 #[derive(Debug)]
-pub struct Matcher {
-    categories: Vec<String>,
-    combined: Regex,
-    per_category: Vec<Regex>,
+pub enum Matcher {
+    /// The built-in pattern: the marker must be the first content token of a
+    /// comment line.
+    Default(CompiledPattern),
+    /// A user-supplied pattern.
+    Custom(CompiledPattern),
 }
 
 impl Matcher {
-    /// Returns the name of the first configured category matched anywhere in
-    /// `text`, or `None` if the comment is not a marker comment.
+    /// Returns the configured category matched in `text`, or `None` if the
+    /// comment is not a marker comment.
     ///
     /// # Examples
     ///
@@ -151,20 +166,102 @@ impl Matcher {
     ///
     /// let matcher = MatchConfig::default().compile().unwrap();
     /// assert_eq!(matcher.match_category("// TODO: handle"), Some("TODO"));
-    /// assert_eq!(matcher.match_category("// TODO handle"), Some("TODO"));
-    /// assert_eq!(matcher.match_category("//todo"), None);
+    /// assert_eq!(matcher.match_category("// todo"), Some("TODO"));
+    /// // Doc comments merely mentioning the marker are not matches.
+    /// assert_eq!(matcher.match_category("/// Triage TODO comments: scan"), None);
     /// assert_eq!(matcher.match_category("// plain note"), None);
+    ///
+    /// let custom = MatchConfig {
+    ///     pattern: Some("^{comment}{marker}:{content}".into()),
+    ///     ..Default::default()
+    /// };
+    /// let matcher = custom.compile().unwrap();
+    /// assert_eq!(matcher.match_category("// TODO: handle"), Some("TODO"));
+    /// assert_eq!(matcher.match_category("// TODO handle"), None);
     /// ```
     pub fn match_category(&self, text: &str) -> Option<&str> {
-        if !self.combined.is_match(text) {
-            return None;
+        match self {
+            Matcher::Default(compiled) => compiled.match_category(text),
+            Matcher::Custom(compiled) => compiled.match_category(text),
         }
+    }
+}
+
+/// The compiled regex plus the configured categories for normalization.
+#[derive(Debug)]
+pub struct CompiledPattern {
+    categories: Vec<String>,
+    regex: Regex,
+}
+
+impl CompiledPattern {
+    fn match_category(&self, text: &str) -> Option<&str> {
+        let matched = self.regex.captures(text)?.name("marker")?.as_str();
+        // The capture always comes from the alternation of configured
+        // categories, so normalization finds it (exact match when
+        // case-sensitive, ignore-case otherwise).
         self.categories
             .iter()
-            .zip(&self.per_category)
-            .find(|(_, re)| re.is_match(text))
-            .map(|(category, _)| category.as_str())
+            .find(|category| category.eq_ignore_ascii_case(matched))
+            .map(String::as_str)
     }
+}
+
+/// Replaces the `{comment}`, `{marker}`, and `{content}` placeholders in a
+/// user pattern. Repetition quantifiers (`{2}`, `{1,3}`) and escaped braces
+/// (`\{`) are left untouched; any other `{name}` is an error.
+fn substitute_placeholders(pattern: &str, marker: &str) -> Result<String, MatchConfigError> {
+    let mut out = String::with_capacity(pattern.len() + 16);
+    let mut rest = pattern;
+    while let Some(rel) = rest.find('{') {
+        let backslashes = rest[..rel].chars().rev().take_while(|&c| c == '\\').count();
+        if backslashes % 2 == 1 {
+            // Escaped brace: `\{` matches a literal `{`.
+            out.push_str(&rest[..rel + 1]);
+            rest = &rest[rel + 1..];
+            continue;
+        }
+        out.push_str(&rest[..rel]);
+        let tail = &rest[rel + 1..];
+        match tail.find('}') {
+            None => {
+                // Unterminated brace: keep the rest verbatim; the regex
+                // compiler reports it if it is invalid.
+                out.push_str(&rest[rel..]);
+                return Ok(out);
+            }
+            Some(end) => {
+                let name = &tail[..end];
+                if is_quantifier(name) {
+                    out.push('{');
+                    out.push_str(name);
+                    out.push('}');
+                } else {
+                    match name {
+                        "comment" => out.push_str(r"\W*"),
+                        "marker" => out.push_str(marker),
+                        "content" => out.push_str(r"(?<content>.*)"),
+                        "" => out.push_str("{}"),
+                        other => {
+                            return Err(MatchConfigError::UnknownPlaceholder(other.to_string()));
+                        }
+                    }
+                }
+                rest = &tail[end + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Whether `{...}` is a repetition quantifier like `{2}`, `{2,}`, `{1,3}`.
+fn is_quantifier(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, ',' | ' '))
+        && name.chars().any(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -177,6 +274,13 @@ mod tests {
             .unwrap()
             .match_category(text)
             .map(str::to_string)
+    }
+
+    fn custom(pattern: &str) -> MatchConfig {
+        MatchConfig {
+            pattern: Some(pattern.to_string()),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -195,41 +299,27 @@ mod tests {
         );
         assert_eq!(match_of(&config, "/// TODO: rustdoc"), Some("TODO".into()));
         assert_eq!(match_of(&config, "# TODO: shell"), Some("TODO".into()));
+        assert_eq!(match_of(&config, "//TODO: no space"), Some("TODO".into()));
     }
 
     #[test]
-    fn default_config_rejects_non_markers() {
+    fn default_config_rejects_doc_mentions_and_non_markers() {
         let config = MatchConfig::default();
-        assert_eq!(match_of(&config, "//TODO: no space"), None);
         assert_eq!(match_of(&config, "// TODOS: plural"), None);
         assert_eq!(match_of(&config, "// NOTTODO"), None);
         assert_eq!(match_of(&config, "// plain note"), None);
         assert_eq!(match_of(&config, "// see http://TODO.example"), None);
         assert_eq!(match_of(&config, "// XTODO"), None);
         assert_eq!(match_of(&config, "// TODOX"), None);
-    }
-
-    #[test]
-    fn space_before_is_configurable() {
-        let config = MatchConfig {
-            require_space_before: false,
-            ..Default::default()
-        };
-        assert_eq!(match_of(&config, "//TODO: no space"), Some("TODO".into()));
-        assert_eq!(match_of(&config, "// XTODO"), None);
-        assert_eq!(match_of(&config, "// TODOX"), None);
-        assert_eq!(match_of(&config, "#TODO"), Some("TODO".into()));
-    }
-
-    #[test]
-    fn colon_requirement() {
-        let config = MatchConfig {
-            require_colon: true,
-            ..Default::default()
-        };
-        assert_eq!(match_of(&config, "// TODO: fix"), Some("TODO".into()));
-        assert_eq!(match_of(&config, "// TODO fix"), None);
-        assert_eq!(match_of(&config, "// TODO"), None);
+        // The point of anchoring: doc comments merely mentioning the marker.
+        assert_eq!(
+            match_of(&config, "/// Triage TODO comments: scan, review"),
+            None
+        );
+        assert_eq!(
+            match_of(&config, "/// Some documentation `// TODO: example`"),
+            None
+        );
     }
 
     #[test]
@@ -243,14 +333,97 @@ mod tests {
     }
 
     #[test]
-    fn first_category_in_config_order_wins() {
+    fn marker_capture_normalizes_case() {
+        let config = MatchConfig::default();
+        assert_eq!(match_of(&config, "// todo: x"), Some("TODO".into()));
+        assert_eq!(match_of(&config, "// FixMe: x"), Some("FIXME".into()));
+    }
+
+    #[test]
+    fn custom_pattern_user_sketch_line_anchored() {
+        // The canonical custom pattern: line-anchored, so `{comment}` cannot
+        // match a stray space before a mid-text marker.
+        let config = custom(r"^\w*{comment}\w*{marker}\w*:\w*{content}");
+        assert_eq!(match_of(&config, "// TODO: fix"), Some("TODO".into()));
+        assert_eq!(match_of(&config, "// TODO: fix"), Some("TODO".into()));
+        assert_eq!(match_of(&config, "# TODO: shell"), Some("TODO".into()));
+        assert_eq!(match_of(&config, "// TODO fix"), None);
+        assert_eq!(match_of(&config, "// TODO"), None);
+        assert_eq!(match_of(&config, "/// Triage TODO comments: scan"), None);
+        assert_eq!(
+            match_of(&config, "/// Some documentation `// TODO: example`"),
+            None
+        );
+    }
+
+    #[test]
+    fn custom_pattern_is_unanchored_by_default() {
+        // Without a `^`, `{comment}` (`\W*`) may match the space before a
+        // mid-text marker — the documented reason to anchor patterns.
+        let config = custom("{comment}{marker}{content}");
+        assert_eq!(
+            match_of(&config, "/// Triage TODO comments: scan"),
+            Some("TODO".into())
+        );
+        assert_eq!(match_of(&config, "// TODO: fix"), Some("TODO".into()));
+    }
+
+    #[test]
+    fn custom_pattern_block_comments() {
+        let config = custom(r"^{comment}{marker}:{content}");
+        assert_eq!(
+            match_of(&config, "/*\n * TODO: later\n */"),
+            Some("TODO".into())
+        );
+        assert_eq!(match_of(&config, "/* TODO: inline */"), Some("TODO".into()));
+    }
+
+    #[test]
+    fn custom_pattern_case_sensitivity() {
         let config = MatchConfig {
-            categories: vec!["PERF".into(), "TODO".into(), "FIXME".into()],
+            case_sensitive: true,
+            pattern: Some(r"^{comment}{marker}:{content}".into()),
             ..Default::default()
         };
-        assert_eq!(match_of(&config, "// FIXME: x"), Some("FIXME".into()));
-        assert_eq!(match_of(&config, "// PERF: x"), Some("PERF".into()));
         assert_eq!(match_of(&config, "// TODO: x"), Some("TODO".into()));
+        assert_eq!(match_of(&config, "// todo: x"), None);
+    }
+
+    #[test]
+    fn custom_pattern_metacharacter_categories() {
+        let config = MatchConfig {
+            categories: vec!["C(TODO".into()],
+            pattern: Some(r"^{comment}{marker}:{content}".into()),
+            ..Default::default()
+        };
+        assert_eq!(match_of(&config, "// C(TODO: x"), Some("C(TODO".into()));
+        assert_eq!(match_of(&config, "// CTODO: x"), None);
+    }
+
+    #[test]
+    fn custom_pattern_leaves_quantifiers_and_escapes_alone() {
+        let config = custom(r"^{comment}{marker}{content}");
+        assert_eq!(match_of(&config, "// TODO something"), Some("TODO".into()));
+        let config = custom(r"^{comment}{marker}:{content} {2}");
+        assert!(config.compile().is_ok());
+        let config = custom(r"^{comment}{marker}:{content}\{escaped\}");
+        assert!(config.compile().is_ok());
+    }
+
+    #[test]
+    fn custom_pattern_errors() {
+        let err = custom(r"{comment}{marker}:{foo}").compile().unwrap_err();
+        assert!(matches!(
+            err,
+            MatchConfigError::UnknownPlaceholder(ref name) if name == "foo"
+        ));
+        assert!(err.to_string().contains("{comment}"));
+
+        let err = custom(r"{comment}{content}").compile().unwrap_err();
+        assert!(matches!(err, MatchConfigError::MissingMarkerPlaceholder));
+
+        let err = custom(r"{comment}{marker}(").compile().unwrap_err();
+        assert!(matches!(err, MatchConfigError::Regex(_)));
     }
 
     #[test]
@@ -273,16 +446,5 @@ mod tests {
             .unwrap_err(),
             MatchConfigError::EmptyCategory
         ));
-    }
-
-    #[test]
-    fn categories_with_regex_metacharacters_are_literal() {
-        let config = MatchConfig {
-            categories: vec!["C(TODO".into()],
-            require_space_before: false,
-            ..Default::default()
-        };
-        assert_eq!(match_of(&config, "// C(TODO"), Some("C(TODO".into()));
-        assert_eq!(match_of(&config, "// CTODO"), None);
     }
 }
