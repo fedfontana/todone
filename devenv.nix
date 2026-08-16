@@ -8,6 +8,8 @@
 
 {
   packages = with pkgs; [
+    # VCS (also required by the git-hooks pre-commit integration).
+    git
     # Forge backend used by `todone port` (GitHub issues via the gh CLI).
     gh
     # Coverage measurement for the test suite.
@@ -20,23 +22,22 @@
 
   pre-commit.enable = true;
   pre-commit.hooks = {
-    cargo-fmt = {
+    rustfmt = {
       enable = true;
-      settings.packageFeatures.workspace = true;
     };
-    cargo-clippy = {
+    clippy = {
       enable = true;
-      settings.clippyArgs = [
-        "--all-targets"
-        "--all-features"
-        "--"
-        "-D"
-        "warnings"
-      ];
+      settings = {
+        denyWarnings = true;
+        allFeatures = true;
+        extraArgs = "--all-targets";
+      };
     };
     cargo-test = {
       enable = true;
-      settings.cargoTestArgs = [ "--all" ];
+      name = "cargo test";
+      entry = "cargo test --all";
+      pass_filenames = false;
     };
   };
 }
