@@ -82,6 +82,8 @@ pub struct PortApp {
     pub pane_width: usize,
     /// Cached sources per repository-relative path.
     sources: HashMap<PathBuf, String>,
+    /// Cached whole-file context lines per repository-relative path.
+    contexts: HashMap<PathBuf, Vec<crate::context::ContextLine>>,
     /// Cached highlight spans per repository-relative path.
     spans: HashMap<PathBuf, Vec<crate::highlight::HighlightSpan>>,
     engine: HighlightEngine,
@@ -124,6 +126,7 @@ impl PortApp {
             pane_height: 0,
             pane_width: 0,
             sources: HashMap::new(),
+            contexts: HashMap::new(),
             spans: HashMap::new(),
             engine: HighlightEngine::new(),
             root: ctx.repo.root.clone(),
@@ -165,24 +168,37 @@ impl PortApp {
         self.session.findings.get_mut(cursor)
     }
 
-    /// The context window for the finding at `cursor`, sized to fill a pane
-    /// of `pane_height` rows (centered on the finding).
-    fn context_for_finding(&mut self, cursor: usize, pane_height: usize) -> Context {
+    /// The context window for the finding at `cursor`.
+    ///
+    /// The whole file is extracted (cached per path) so the pane can scroll
+    /// through everything; only the selection is refreshed per frame.
+    fn context_for_finding(&mut self, cursor: usize) -> Context {
         let Some(finding) = self.session.findings.get(cursor).cloned() else {
             return Context {
                 lines: Vec::new(),
                 selection: 0..0,
             };
         };
+        let path = finding.path().to_path_buf();
         let source = self.source_of(&finding).to_string();
-        let (before, after) = (pane_height / 2, pane_height - pane_height / 2);
-        extract_context(&source, &finding, before, after)
+        let total = source.lines().count().max(1);
+        let before = finding.line().saturating_sub(1);
+        let after = total.saturating_sub(finding.line());
+        let lines = self
+            .contexts
+            .entry(path)
+            .or_insert_with(|| extract_context(&source, &finding, before, after).lines)
+            .clone();
+        Context {
+            lines,
+            selection: finding.selected_range(),
+        }
     }
 
     /// The context pane plus the rendered row count of each line and the
     /// total height.
-    fn view(&mut self, pane_height: usize, pane_width: usize) -> (Context, Vec<usize>, usize) {
-        let context = self.context_for_finding(self.session.cursor(), pane_height);
+    fn view(&mut self, _pane_height: usize, pane_width: usize) -> (Context, Vec<usize>, usize) {
+        let context = self.context_for_finding(self.session.cursor());
         let rows: Vec<usize> = context
             .lines
             .iter()
@@ -192,10 +208,15 @@ impl PortApp {
         (context, rows, total)
     }
 
+    /// The maximum scroll offset for the current pane.
+    fn max_scroll(&mut self) -> usize {
+        let (_, _, total) = self.view(self.pane_height, self.pane_width);
+        total.saturating_sub(self.pane_height)
+    }
+
     /// Scrolls the context pane by `delta` rendered rows, clamped.
     fn scroll_lines(&mut self, delta: isize) {
-        let (_, _, total) = self.view(self.pane_height, self.pane_width);
-        let max = total.saturating_sub(self.pane_height);
+        let max = self.max_scroll();
         self.v_scroll = (self.v_scroll as isize + delta).clamp(0, max as isize) as usize;
     }
 
@@ -642,12 +663,22 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, app: &PortApp) {
     ));
     frame.render_widget(Paragraph::new(line), area);
 }
-
-/// Converts the context window into styled ratatui lines.
-fn context_to_lines(app: &mut PortApp, context: &Context) -> Vec<Line<'static>> {
+/// Converts the visible part of the context window into styled ratatui
+/// lines: only lines intersecting the viewport are built, so the per-frame
+/// cost stays proportional to the pane rather than the file.
+fn context_to_lines(
+    app: &mut PortApp,
+    context: &Context,
+    rows: &[usize],
+    v_scroll: usize,
+    pane_height: usize,
+) -> Vec<Line<'static>> {
     let Some(finding) = app.session.findings.get(app.session.cursor()).cloned() else {
         return Vec::new();
     };
+    if context.lines.is_empty() {
+        return Vec::new();
+    }
     let selection = context.selection.clone();
     let spans = app.spans_of(&finding);
     let width = context
@@ -657,8 +688,24 @@ fn context_to_lines(app: &mut PortApp, context: &Context) -> Vec<Line<'static>> 
         .max()
         .unwrap_or(1);
 
+    // Cumulative row starts, so the visible line range can be found.
+    let mut starts = Vec::with_capacity(rows.len() + 1);
+    let mut acc = 0;
+    starts.push(0);
+    for count in rows {
+        acc += count;
+        starts.push(acc);
+    }
+    let view_end = v_scroll + pane_height;
+    let first = (0..rows.len()).find(|&i| starts[i] + rows[i] > v_scroll);
+    let last = (0..rows.len()).rev().find(|&i| starts[i] < view_end);
+    let (Some(first), Some(last)) = (first, last) else {
+        return Vec::new();
+    };
+
     let mut out = Vec::new();
-    for line in context.lines.iter() {
+    for index in 0..=last - first {
+        let line = &context.lines[first + index];
         let marker =
             if line.byte_range.start < selection.end && line.byte_range.end > selection.start {
                 ">"
@@ -699,11 +746,12 @@ fn context_to_lines(app: &mut PortApp, context: &Context) -> Vec<Line<'static>> 
 }
 
 fn render_context_area(frame: &mut ratatui::Frame, area: Rect, app: &mut PortApp) {
-    let height = area.height as usize;
-    let width = area.width as usize;
+    // The paragraph content sits inside the block's borders.
+    let height = area.height.saturating_sub(2) as usize;
+    let width = area.width.saturating_sub(2) as usize;
     app.pane_height = height;
     app.pane_width = width;
-    let (context, _, total) = app.view(height, width);
+    let (context, rows, total) = app.view(height, width);
 
     let max = total.saturating_sub(height);
     if app.v_scroll > max {
@@ -711,7 +759,7 @@ fn render_context_area(frame: &mut ratatui::Frame, area: Rect, app: &mut PortApp
     }
     app.scroll_label = app.scroll_label();
 
-    let lines = context_to_lines(app, &context);
+    let lines = context_to_lines(app, &context, &rows, app.v_scroll, height);
     let mut paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL))
         .scroll((app.v_scroll as u16, app.h_scroll as u16));
@@ -1286,6 +1334,49 @@ mod tests {
         app.handle_key(key(KeyCode::Char('z')));
         assert!(app.v_scroll > 0);
         assert!(app.v_scroll <= max);
+    }
+
+    #[test]
+    fn context_spans_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let mut content = String::new();
+        for i in 1..=200 {
+            content.push_str(&format!("before line {i}\n"));
+        }
+        content.push_str("// TODO: x\n");
+        for i in 202..=400 {
+            content.push_str(&format!("after line {i}\n"));
+        }
+        std::fs::write(dir.path().join("src/a.rs"), content).unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: None,
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let mut app = PortApp::new(Session::new(vec![finding(201, 201)], "abc".into()), &ctx);
+
+        // The whole file is navigable: line 1 and line 400 are in the window.
+        let context = app.context_for_finding(app.session.cursor());
+        assert_eq!(context.lines.len(), 400);
+        assert_eq!(context.lines.first().unwrap().line, 1);
+        assert_eq!(context.lines.last().unwrap().line, 400);
+
+        // Scrolling reaches the very bottom of the file.
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.handle_key(key(KeyCode::Char('G')));
+        let max = app.max_scroll();
+        let (context, _, _) = app.view(app.pane_height, app.pane_width);
+        let last = context.lines.last().unwrap().line;
+        assert_eq!(last, 400);
+        assert_eq!(app.v_scroll, max);
     }
 
     #[test]
