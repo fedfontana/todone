@@ -57,6 +57,8 @@ pub struct ContextConfig {
     pub after: usize,
     /// Word-wrap long context lines in the TUI (toggleable with `w`).
     pub wrap: bool,
+    /// Tab width used when expanding tabs in the TUI context view.
+    pub tab_width: usize,
 }
 
 /// Issue-tracking backend selection.
@@ -86,6 +88,7 @@ impl Default for Config {
                 before: 3,
                 after: 3,
                 wrap: true,
+                tab_width: 4,
             },
             forge: ForgeConfig {
                 kind: "github".into(),
@@ -217,6 +220,9 @@ impl Config {
         if let Some(wrap) = overrides.wrap {
             self.context.wrap = wrap;
         }
+        if let Some(tab_width) = overrides.tab_width {
+            self.context.tab_width = tab_width;
+        }
         if let Some(kind) = &overrides.forge {
             self.forge.kind = kind.clone();
         }
@@ -308,6 +314,8 @@ before = 3
 after = 3
 # Word-wrap long context lines in the interactive review (toggle with `w`).
 wrap = true
+# Tab width for the interactive context view (tabs are expanded to spaces).
+tab_width = 4
 
 [forge]
 # Issue-tracking backend: "github" (v1, via the gh CLI).
@@ -423,6 +431,8 @@ pub struct CliOverrides {
     pub context_after: Option<usize>,
     /// `--wrap` / `--no-wrap`.
     pub wrap: Option<bool>,
+    /// `--tab-width`.
+    pub tab_width: Option<usize>,
     /// `--forge`.
     pub forge: Option<String>,
     /// `--editor`.

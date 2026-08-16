@@ -65,6 +65,8 @@ pub struct PortApp {
     pub auto_confirm: bool,
     /// Word wrap on the context pane.
     pub wrap: bool,
+    /// Tab width for expanding tabs in the context pane.
+    pub tab_width: usize,
     /// Vertical scroll offset (rendered rows) of the context pane.
     pub v_scroll: usize,
     /// Horizontal scroll offset (characters; only visible without wrap).
@@ -117,6 +119,7 @@ impl PortApp {
             dry_run: false,
             auto_confirm: false,
             wrap: ctx.config.context.wrap,
+            tab_width: ctx.config.context.tab_width,
             v_scroll: 0,
             h_scroll: 0,
             repo_name,
@@ -202,7 +205,7 @@ impl PortApp {
         let rows: Vec<usize> = context
             .lines
             .iter()
-            .map(|line| rendered_rows(&line.text, pane_width, self.wrap))
+            .map(|line| rendered_rows(&line.text, pane_width, self.wrap, self.tab_width))
             .collect();
         let total = rows.iter().sum();
         (context, rows, total)
@@ -546,11 +549,30 @@ impl PortApp {
     }
 }
 
-/// The number of display rows a context line occupies at `width`.
-fn rendered_rows(text: &str, width: usize, wrap: bool) -> usize {
+/// Expands tabs to spaces with `tab_width` tab stops.
+fn expand_tabs(text: &str, tab_width: usize) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut col = 0usize;
+    for ch in text.chars() {
+        if ch == '\t' {
+            let spaces = tab_width - col % tab_width;
+            out.extend(std::iter::repeat_n(' ', spaces));
+            col += spaces;
+        } else {
+            col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The number of display rows a context line occupies at `width`, after tab
+/// expansion.
+fn rendered_rows(text: &str, width: usize, wrap: bool, tab_width: usize) -> usize {
     if !wrap || width == 0 {
         return 1;
     }
+    let text = expand_tabs(text, tab_width);
     let mut rows = 1usize;
     let mut col = 0usize;
     for word in text.split_whitespace() {
@@ -719,6 +741,7 @@ fn context_to_lines(
             Style::default().fg(Color::Rgb(90, 100, 110)),
         ));
 
+        let mut col = 0usize;
         for (i, ch) in line.text.char_indices() {
             let offset = line.byte_range.start + i;
             let span = spans
@@ -738,7 +761,16 @@ fn context_to_lines(
             if offset >= selection.start && offset < selection.end {
                 style = style.bg(Color::Rgb(38, 46, 58));
             }
-            spans_line.push(Span::styled(ch.to_string(), style));
+            // Tabs are control characters: ratatui drops them, so they are
+            // expanded to spaces here (style included).
+            if ch == '\t' {
+                let spaces = app.tab_width - col % app.tab_width;
+                col += spaces;
+                spans_line.push(Span::styled(" ".repeat(spaces), style));
+            } else {
+                col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                spans_line.push(Span::styled(ch.to_string(), style));
+            }
         }
         out.push(Line::from(spans_line));
     }
@@ -1380,6 +1412,43 @@ mod tests {
     }
 
     #[test]
+    fn tabs_are_expanded_in_the_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "\tlet x = 1;\n// TODO: x\n").unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: None,
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let mut app = PortApp::new(Session::new(vec![finding(2, 2)], "abc".into()), &ctx);
+        assert_eq!(app.tab_width, 4, "tab width defaults to 4");
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            content.contains("    let x = 1;"),
+            "tab must expand to four spaces:\n{content}"
+        );
+        assert!(!content.contains('\t'), "no raw tabs in the buffer");
+    }
+
+    #[test]
+    fn tab_width_comes_from_config() {
+        let (mut ctx, _dir) = ctx_for(finding(1, 1));
+        ctx.config.context.tab_width = 8;
+        let app = PortApp::new(Session::new(vec![finding(1, 1)], "abc".into()), &ctx);
+        assert_eq!(app.tab_width, 8);
+    }
+
+    #[test]
     fn snippet_excludes_the_comment_lines() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -1424,14 +1493,18 @@ mod tests {
 
     #[test]
     fn rendered_rows_estimates_wrapping() {
-        assert_eq!(rendered_rows("short line", 80, true), 1);
-        assert_eq!(rendered_rows("short line", 80, false), 1);
+        assert_eq!(rendered_rows("short line", 80, true, 4), 1);
+        assert_eq!(rendered_rows("short line", 80, false, 4), 1);
         // Two words that do not fit on one line.
-        assert!(rendered_rows("aaaaaaaaaa bbbbbbbbbb", 10, true) > 1);
+        assert!(rendered_rows("aaaaaaaaaa bbbbbbbbbb", 10, true, 4) > 1);
         // A word longer than the pane spans multiple rows.
-        assert!(rendered_rows("aaaaaaaaaaaaaaaaaaaa", 8, true) >= 3);
+        assert!(rendered_rows("aaaaaaaaaaaaaaaaaaaa", 8, true, 4) >= 3);
         // Empty text still occupies a row.
-        assert_eq!(rendered_rows("", 80, true), 1);
+        assert_eq!(rendered_rows("", 80, true, 4), 1);
+        // Tabs expand before wrapping: a tab is tab_width columns.
+        assert_eq!(rendered_rows("\tword", 80, true, 4), 1);
+        assert!(rendered_rows("\taaaaaaaaaa", 8, true, 4) > 1);
+        assert_eq!(rendered_rows("\tword", 80, true, 2), 1);
     }
 
     #[test]

@@ -538,6 +538,17 @@ fn port_skips_non_utf8_files() {
 }
 
 #[test]
+fn scan_accepts_tab_width_flag() {
+    let dir = repo_fixture();
+    todone()
+        .current_dir(dir.path())
+        .args(["scan", "--tab-width", "8", "--no-wrap"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("src/main.rs:2: TODO"));
+}
+
+#[test]
 fn completions_generate_for_shells() {
     let output = todone()
         .arg("completions")

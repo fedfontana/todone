@@ -28,6 +28,7 @@ pub fn overrides(args: &CommonScanArgs) -> CliOverrides {
         context_before: args.before,
         context_after: args.after,
         wrap: flag(args.wrap, args.no_wrap),
+        tab_width: args.tab_width,
         ..Default::default()
     }
 }

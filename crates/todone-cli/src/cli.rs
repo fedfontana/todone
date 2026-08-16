@@ -48,6 +48,9 @@ pub struct CommonScanArgs {
     /// Do not word-wrap context lines.
     #[arg(long, conflicts_with = "wrap")]
     pub no_wrap: bool,
+    /// Tab width for the interactive context view.
+    #[arg(long)]
+    pub tab_width: Option<usize>,
     /// Comma-separated marker categories, e.g. `TODO,FIXME,PERF`.
     #[arg(long)]
     pub pattern: Option<String>,

@@ -169,6 +169,7 @@ case_sensitive = false           # "todo" matches "TODO" ({marker} only)
 before = 3                       # context lines before a finding
 after = 3                        # context lines after a finding
 wrap = true                      # word-wrap context lines in the TUI (w toggles)
+tab_width = 4                    # tab expansion width in the TUI context view
 
 [forge]
 kind = "github"                  # v1 only; the Forge trait is the seam
