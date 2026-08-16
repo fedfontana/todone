@@ -42,7 +42,7 @@ impl Default for ScanOptions {
 }
 
 /// Aggregate counters for a scan pass.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ScanStats {
     /// Files that were parsed.
     pub files: usize,
@@ -184,13 +184,21 @@ impl Scanner {
         while let Some(node) = stack.pop() {
             if lang.comment_kinds.contains(&node.kind()) {
                 let range = node.byte_range();
+                // Line-comment tokens include the trailing newline; the text
+                // field stops before it and end_line names the last line
+                // that actually carries comment text.
+                let raw = &source[range.clone()];
+                let (text, end_line) = match raw.strip_suffix('\n') {
+                    Some(body) => (body, node.end_position().row),
+                    None => (raw, node.end_position().row + 1),
+                };
                 comments.push(Comment {
                     path: path.clone(),
                     line: node.start_position().row + 1,
-                    end_line: node.end_position().row + 1,
+                    end_line,
                     column: node.start_position().column,
                     byte_range: range.clone(),
-                    text: source[range].to_string(),
+                    text: text.to_string(),
                     language: lang.id.to_string(),
                 });
             }

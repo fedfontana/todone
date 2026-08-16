@@ -37,6 +37,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScanConfig {
     /// Marker category matching.
+    #[serde(rename = "match")]
     pub match_config: MatchConfig,
     /// Default scope: paths (relative to the repo root) to scan when none
     /// are given on the command line.
