@@ -1,0 +1,15 @@
+[package]
+name = "todone-forge"
+description = "Issue-tracking forge abstraction and backends for todone"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+todone-core = { path = "../todone-core" }
+
+[dev-dependencies]
+pretty_assertions.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "todone-core"
+description = "Scanning, matching, removal, configuration, and session state for todone"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ignore.workspace = true
+regex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tree-sitter.workspace = true
+tree-sitter-language.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
