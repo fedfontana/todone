@@ -18,7 +18,7 @@ use crate::cli::{Cli, Command};
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let color = resolve_color(cli.color, cli.no_color);
+    let color = resolve_color(cli.color, cli.no_color, std::io::stdout().is_terminal());
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -65,14 +65,14 @@ fn is_broken_pipe(err: &anyhow::Error) -> bool {
 }
 
 /// Decides whether output is colored: explicit flags win, otherwise only
-/// when stdout is a terminal.
-fn resolve_color(force: bool, no_color: bool) -> bool {
+/// when `stdout_is_tty`.
+fn resolve_color(force: bool, no_color: bool, stdout_is_tty: bool) -> bool {
     if force {
         true
     } else if no_color {
         false
     } else {
-        std::io::stdout().is_terminal()
+        stdout_is_tty
     }
 }
 
@@ -82,9 +82,10 @@ mod tests {
 
     #[test]
     fn color_resolution() {
-        assert!(resolve_color(true, false));
-        assert!(resolve_color(true, true));
-        assert!(!resolve_color(false, true));
-        assert!(!resolve_color(false, false));
+        assert!(resolve_color(true, false, false));
+        assert!(resolve_color(true, true, false));
+        assert!(!resolve_color(false, true, true));
+        assert!(!resolve_color(false, false, false));
+        assert!(resolve_color(false, false, true));
     }
 }
