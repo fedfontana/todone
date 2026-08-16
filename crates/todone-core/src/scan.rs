@@ -4,7 +4,7 @@
 //! The scanner never writes anything; it is a pure read-only pass. All
 //! findings carry the byte ranges needed to later remove comments.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
@@ -54,6 +54,8 @@ pub struct ScanStats {
     pub skipped_too_large: usize,
     /// Files skipped because no grammar is registered for them.
     pub skipped_unsupported: usize,
+    /// Files skipped because their language's grammar could not be loaded.
+    pub skipped_grammar: usize,
 }
 
 /// The outcome of a scan pass: findings plus statistics.
@@ -84,6 +86,15 @@ pub enum ScanError {
         /// The language id used.
         language: &'static str,
     },
+    /// A language's grammar could not be loaded (e.g. offline with an empty
+    /// cache); the file is skipped rather than failing the scan.
+    #[error("failed to load grammar for {language}: {detail}")]
+    Grammar {
+        /// The language id.
+        language: String,
+        /// The underlying error.
+        detail: String,
+    },
     /// The category configuration is invalid.
     #[error(transparent)]
     MatchConfig(#[from] crate::matcher::MatchConfigError),
@@ -97,6 +108,8 @@ pub enum ScanError {
 pub struct Scanner {
     matcher: Matcher,
     options: ScanOptions,
+    /// Resolved grammars, keyed by language id.
+    grammars: std::cell::RefCell<HashMap<&'static str, tree_sitter::Language>>,
 }
 
 impl Scanner {
@@ -107,7 +120,11 @@ impl Scanner {
     /// Returns an error if the options' match configuration is invalid.
     pub fn new(options: ScanOptions) -> Result<Self, ScanError> {
         let matcher = options.match_config.compile()?;
-        Ok(Self { matcher, options })
+        Ok(Self {
+            matcher,
+            options,
+            grammars: std::cell::RefCell::new(HashMap::new()),
+        })
     }
 
     /// Scans the repository rooted at `root`, returning findings sorted by
@@ -144,12 +161,16 @@ impl Scanner {
             stats.files += 1;
 
             let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-            let comments = self
-                .parse_comments(relative, lang, source)
-                .map_err(|language| ScanError::Parse {
-                    path: path.clone(),
-                    language,
-                })?;
+            let comments = match self.parse_comments(relative, lang, source) {
+                Ok(comments) => comments,
+                // Unavailable grammars skip the file; the rest of the scan
+                // proceeds (e.g. offline with a cold cache).
+                Err(ScanError::Grammar { .. }) => {
+                    stats.skipped_grammar += 1;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             for run in group_runs(&comments) {
                 if let Some((primary, category)) = first_match(&run, &self.matcher) {
                     let selection = Selection::full(run.comments.len());
@@ -174,10 +195,17 @@ impl Scanner {
         path: PathBuf,
         lang: &Language,
         source: &str,
-    ) -> Result<Vec<Comment>, &'static str> {
+    ) -> Result<Vec<Comment>, ScanError> {
+        let ts = self.grammar(lang.id)?;
         let mut parser = Parser::new();
-        parser.set_language(&lang.ts()).map_err(|_| lang.id)?;
-        let tree = parser.parse(source, None).ok_or(lang.id)?;
+        parser.set_language(&ts).map_err(|_| ScanError::Parse {
+            path: path.clone(),
+            language: lang.id,
+        })?;
+        let tree = parser.parse(source, None).ok_or_else(|| ScanError::Parse {
+            path: path.clone(),
+            language: lang.id,
+        })?;
 
         let mut comments = Vec::new();
         let mut stack = vec![tree.root_node()];
@@ -207,6 +235,20 @@ impl Scanner {
         }
         comments.sort_by_key(|c| c.byte_range.start);
         Ok(comments)
+    }
+
+    /// Resolves the grammar for a language id, caching it for the scanner's
+    /// lifetime.
+    fn grammar(&self, id: &'static str) -> Result<tree_sitter::Language, ScanError> {
+        if let Some(ts) = self.grammars.borrow().get(id) {
+            return Ok(ts.clone());
+        }
+        let ts = crate::language::grammar(id).map_err(|e| ScanError::Grammar {
+            language: id.to_string(),
+            detail: e.to_string(),
+        })?;
+        self.grammars.borrow_mut().insert(id, ts.clone());
+        Ok(ts)
     }
 }
 

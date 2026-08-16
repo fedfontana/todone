@@ -1,20 +1,23 @@
-//! Language detection and the tree-sitter grammar registry.
+//! Language detection and grammar loading.
 //!
-//! Each language knows the file extensions that map to it and the
-//! tree-sitter node kinds that represent comments. The registry is a
-//! curated, fixed set for v1; unknown languages are reported as skipped
-//! rather than guessed at.
+//! The registry maps file extensions to a curated set of languages with
+//! their tree-sitter comment node kinds. Grammars themselves are loaded
+//! dynamically from [`tree_sitter_language_pack`]: they are downloaded on
+//! first use (if not already cached) and stored under the state directory
+//! (see [`cache_base_dir`]), so a warm machine never touches the network.
 
-use std::path::Path;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
-use tree_sitter_language::LanguageFn;
+use thiserror::Error;
 
-/// A registered language backed by a tree-sitter grammar.
+/// A registered language.
 ///
-/// Instances are `'static` table entries; all fields are fixed at compile
-/// time.
+/// Instances are `'static` table entries; the grammar is resolved lazily
+/// via [`grammar`] on first use.
 pub struct Language {
-    /// Stable identifier used in configuration and JSON output (e.g. `rust`).
+    /// Stable identifier used in configuration and JSON output (also the
+    /// tree-sitter-language-pack name, e.g. `rust`).
     pub id: &'static str,
     /// Human-readable display name (e.g. `Rust`).
     pub name: &'static str,
@@ -23,28 +26,18 @@ pub struct Language {
     /// The registry is consulted in order, so `c` before `cpp` makes `.h`
     /// resolve to C.
     pub extensions: &'static [&'static str],
-    /// The tree-sitter grammar.
-    pub grammar: LanguageFn,
     /// Node kinds that represent comments in this grammar's tree.
     pub comment_kinds: &'static [&'static str],
 }
 
-impl Language {
-    /// Converts the grammar into a `tree_sitter::Language`.
-    pub fn ts(&self) -> tree_sitter::Language {
-        self.grammar.into()
-    }
-}
-
 macro_rules! languages {
-    ($( $id:literal, $name:literal, [$($ext:literal),*], $grammar:expr, [$($kind:literal),*]; )*) => {
+    ($( $id:literal, $name:literal, [$($ext:literal),*], [$($kind:literal),*]; )*) => {
         /// Every language the scanner knows about, in registry order.
         pub const ALL: &[Language] = &[
             $(Language {
                 id: $id,
                 name: $name,
                 extensions: &[$($ext),*],
-                grammar: $grammar,
                 comment_kinds: &[$($kind),*],
             }),*
         ];
@@ -52,15 +45,15 @@ macro_rules! languages {
 }
 
 languages! {
-    "rust", "Rust", ["rs"], tree_sitter_rust::LANGUAGE, ["line_comment", "block_comment"];
-    "python", "Python", ["py", "pyi"], tree_sitter_python::LANGUAGE, ["comment"];
-    "c", "C", ["c", "h"], tree_sitter_c::LANGUAGE, ["comment"];
-    "cpp", "C++", ["cc", "cpp", "cxx", "hpp", "hh", "hxx"], tree_sitter_cpp::LANGUAGE, ["comment"];
-    "go", "Go", ["go"], tree_sitter_go::LANGUAGE, ["comment"];
-    "typescript", "TypeScript", ["ts", "mts", "cts"], tree_sitter_typescript::LANGUAGE_TYPESCRIPT, ["comment"];
-    "tsx", "TSX", ["tsx"], tree_sitter_typescript::LANGUAGE_TSX, ["comment"];
-    "bash", "Bash", ["sh", "bash", "zsh", "ksh"], tree_sitter_bash::LANGUAGE, ["comment"];
-    "json", "JSON", ["json"], tree_sitter_json::LANGUAGE, ["comment"];
+    "rust", "Rust", ["rs"], ["line_comment", "block_comment"];
+    "python", "Python", ["py", "pyi"], ["comment"];
+    "c", "C", ["c", "h"], ["comment"];
+    "cpp", "C++", ["cc", "cpp", "cxx", "hpp", "hh", "hxx"], ["comment"];
+    "go", "Go", ["go"], ["comment"];
+    "typescript", "TypeScript", ["ts", "mts", "cts"], ["comment"];
+    "tsx", "TSX", ["tsx"], ["comment"];
+    "bash", "Bash", ["sh", "bash", "zsh", "ksh"], ["comment"];
+    "json", "JSON", ["json"], ["comment"];
 }
 
 /// Looks up the language registered for a file's extension.
@@ -75,14 +68,133 @@ languages! {
 /// assert_eq!(lang.id, "rust");
 /// assert!(language::by_extension(Path::new("README.txt")).is_none());
 /// ```
-pub fn by_extension(path: &Path) -> Option<&'static Language> {
+pub fn by_extension(path: &std::path::Path) -> Option<&'static Language> {
     let ext = path.extension()?.to_str()?;
     ALL.iter().find(|lang| lang.extensions.contains(&ext))
+}
+
+/// The base directory for downloaded grammars: `$TODONE_GRAMMAR_DIR`,
+/// `$XDG_STATE_HOME/todone`, or `~/.local/state/todone`.
+///
+/// tree-sitter-language-pack appends its own
+/// `tree-sitter-language-pack/v{version}/libs` suffix below this base.
+///
+/// # Examples
+///
+/// ```
+/// use todone_core::language::cache_base_dir;
+///
+/// let dir = cache_base_dir();
+/// assert!(dir.as_os_str().len() > 0);
+/// ```
+pub fn cache_base_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("TODONE_GRAMMAR_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(xdg).join("todone");
+    }
+    std::env::var_os("HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("todone")
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("todone-state"))
+}
+
+/// Errors produced while loading a grammar.
+#[derive(Debug, Error)]
+pub enum GrammarError {
+    /// The grammar could not be loaded or downloaded.
+    #[error("failed to load grammar for {language}: {detail}")]
+    Load {
+        /// The language id.
+        language: String,
+        /// The underlying error from tree-sitter-language-pack.
+        detail: String,
+    },
+}
+
+/// One-time configuration of the grammar cache directory, run before the
+/// first grammar load.
+fn ensure_configured() -> Result<(), String> {
+    static CONFIGURED: OnceLock<Result<(), String>> = OnceLock::new();
+    CONFIGURED
+        .get_or_init(|| {
+            let config = tree_sitter_language_pack::PackConfig {
+                cache_dir: Some(cache_base_dir()),
+                languages: None,
+                groups: None,
+            };
+            tree_sitter_language_pack::configure(&config).map_err(|e| e.to_string())
+        })
+        .clone()
+}
+
+/// Loads the grammar for a language id (downloading it on first use).
+///
+/// # Errors
+///
+/// Returns a [`GrammarError`] when the language is unknown to
+/// tree-sitter-language-pack or the grammar cannot be downloaded or loaded.
+///
+/// # Examples
+///
+/// ```
+/// use todone_core::language::grammar;
+///
+/// // A known language resolves (downloading the grammar on a cold cache).
+/// let result = grammar("rust");
+/// assert!(result.is_ok() || result.is_err());
+///
+/// // An unknown language always fails.
+/// assert!(grammar("definitely-not-a-language").is_err());
+/// ```
+pub fn grammar(id: &str) -> Result<tree_sitter::Language, GrammarError> {
+    ensure_configured().map_err(|detail| GrammarError::Load {
+        language: id.to_string(),
+        detail,
+    })?;
+    tree_sitter_language_pack::get_language(id).map_err(|error| GrammarError::Load {
+        language: id.to_string(),
+        detail: error.to_string(),
+    })
+}
+
+/// The highlight queries bundled for a language, if any.
+///
+/// # Examples
+///
+/// ```
+/// use todone_core::language::highlights_query;
+///
+/// assert!(highlights_query("rust").is_some());
+/// assert!(highlights_query("definitely-not-a-language").is_none());
+/// ```
+pub fn highlights_query(id: &str) -> Option<&'static str> {
+    tree_sitter_language_pack::get_highlights_query(id)
+}
+
+/// The injections query bundled for a language, if any.
+pub fn injections_query(id: &str) -> Option<&'static str> {
+    tree_sitter_language_pack::get_injections_query(id)
+}
+
+/// The locals query bundled for a language, if any.
+pub fn locals_query(id: &str) -> Option<&'static str> {
+    tree_sitter_language_pack::get_locals_query(id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Guards against concurrent grammar resolution in tests (the underlying
+    /// registry is process-wide).
+    static GRAMMAR_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn resolves_known_extensions() {
@@ -103,7 +215,7 @@ mod tests {
         ];
         for (file, id) in cases {
             assert_eq!(
-                by_extension(Path::new(file)).map(|l| l.id),
+                by_extension(std::path::Path::new(file)).map(|l| l.id),
                 Some(id),
                 "{file}"
             );
@@ -112,13 +224,45 @@ mod tests {
 
     #[test]
     fn unknown_and_extensionless_files_resolve_to_none() {
-        assert!(by_extension(Path::new("Makefile")).is_none());
-        assert!(by_extension(Path::new("notes.txt")).is_none());
-        assert!(by_extension(Path::new("noext")).is_none());
+        assert!(by_extension(std::path::Path::new("Makefile")).is_none());
+        assert!(by_extension(std::path::Path::new("notes.txt")).is_none());
+        assert!(by_extension(std::path::Path::new("noext")).is_none());
     }
 
     #[test]
     fn c_wins_over_cpp_for_dot_h() {
-        assert_eq!(by_extension(Path::new("x.h")).unwrap().id, "c");
+        assert_eq!(by_extension(std::path::Path::new("x.h")).unwrap().id, "c");
+    }
+
+    #[test]
+    fn grammar_resolves_known_languages_and_rejects_unknown() {
+        let _guard = GRAMMAR_LOCK.lock().unwrap();
+        for lang in ALL {
+            let ts = grammar(lang.id).unwrap_or_else(|e| panic!("{}: {e}", lang.id));
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&ts).expect("language accepted");
+        }
+        assert!(grammar("definitely-not-a-language").is_err());
+    }
+
+    #[test]
+    fn bundled_queries_cover_the_curated_set() {
+        for lang in ALL {
+            assert!(
+                highlights_query(lang.id).is_some(),
+                "missing highlights for {}",
+                lang.id
+            );
+        }
+    }
+
+    #[test]
+    fn cache_base_dir_follows_environment() {
+        unsafe { std::env::set_var("TODONE_GRAMMAR_DIR", "/tmp/todone-grammars") };
+        assert_eq!(cache_base_dir(), PathBuf::from("/tmp/todone-grammars"));
+        unsafe { std::env::remove_var("TODONE_GRAMMAR_DIR") };
+
+        let dir = cache_base_dir();
+        assert!(!dir.as_os_str().is_empty());
     }
 }

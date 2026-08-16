@@ -14,15 +14,8 @@ tempfile = "3"
 thiserror.workspace = true
 toml.workspace = true
 tree-sitter.workspace = true
-tree-sitter-language.workspace = true
-tree-sitter-bash = "0.25"
-tree-sitter-c = "0.24"
-tree-sitter-cpp = "0.23"
-tree-sitter-go = "0.25"
-tree-sitter-json = "0.24"
-tree-sitter-python = "0.25"
-tree-sitter-rust = "0.24"
-tree-sitter-typescript = "0.23"
+tree-sitter-language = "0.1"
+tree-sitter-language-pack = "1.15"
 
 [dev-dependencies]
 pretty_assertions.workspace = true

@@ -94,10 +94,7 @@ pub const THEME: &[(&str, ThemeStyle)] = &[
 
 /// Resolves a tree-sitter language for a language id.
 pub fn language_ts(id: &str) -> Option<tree_sitter::Language> {
-    todone_core::language::ALL
-        .iter()
-        .find(|lang| lang.id == id)
-        .map(|lang| lang.ts())
+    todone_core::language::grammar(id).ok()
 }
 
 /// Errors from the highlighting engine.
@@ -124,7 +121,7 @@ pub enum HighlightError {
     },
 }
 
-/// Vendored query text for one language.
+/// Query text for one language, bundled with tree-sitter-language-pack.
 struct QuerySet {
     highlights: &'static str,
     injections: &'static str,
@@ -132,55 +129,12 @@ struct QuerySet {
 }
 
 fn query_set(language: &str) -> Option<QuerySet> {
-    let set = match language {
-        "rust" => QuerySet {
-            highlights: include_str!("../queries/rust/highlights.scm"),
-            injections: include_str!("../queries/rust/injections.scm"),
-            locals: "",
-        },
-        "python" => QuerySet {
-            highlights: include_str!("../queries/python/highlights.scm"),
-            injections: "",
-            locals: "",
-        },
-        "c" => QuerySet {
-            highlights: include_str!("../queries/c/highlights.scm"),
-            injections: "",
-            locals: "",
-        },
-        "cpp" => QuerySet {
-            highlights: include_str!("../queries/cpp/highlights.scm"),
-            injections: include_str!("../queries/cpp/injections.scm"),
-            locals: "",
-        },
-        "go" => QuerySet {
-            highlights: include_str!("../queries/go/highlights.scm"),
-            injections: "",
-            locals: "",
-        },
-        "bash" => QuerySet {
-            highlights: include_str!("../queries/bash/highlights.scm"),
-            injections: "",
-            locals: "",
-        },
-        "json" => QuerySet {
-            highlights: include_str!("../queries/json/highlights.scm"),
-            injections: "",
-            locals: "",
-        },
-        "typescript" => QuerySet {
-            highlights: include_str!("../queries/typescript/highlights.scm"),
-            injections: "",
-            locals: "",
-        },
-        "tsx" => QuerySet {
-            highlights: include_str!("../queries/tsx/highlights.scm"),
-            injections: "",
-            locals: "",
-        },
-        _ => return None,
-    };
-    Some(set)
+    let highlights = todone_core::language::highlights_query(language)?;
+    Some(QuerySet {
+        highlights,
+        injections: todone_core::language::injections_query(language).unwrap_or(""),
+        locals: todone_core::language::locals_query(language).unwrap_or(""),
+    })
 }
 
 /// Highlights source files with cached per-language configurations.
@@ -320,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn all_languages_have_vendored_queries() {
+    fn all_languages_have_bundled_queries() {
         for lang in todone_core::language::ALL {
             assert!(
                 query_set(lang.id).is_some(),
