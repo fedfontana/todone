@@ -55,15 +55,9 @@ todone scan --json               # machine-readable report
 
 ### `todone port`
 
-The interactive flow. One screen per finding:
-
-```
- 1/3 — crates/todone-cli/src/cli.rs:7: TODO  (2 undecided)
-┌──────────────────────────────────────────────────────────────┐
-│ >  7 │ /// Triage TODO comments: scan, review, and port...    │
-└──────────────────────────────────────────────────────────────┘
-p port · s skip · d delete · o view · e select · j/k nav · c confirm · ? help · q quit
-```
+The interactive flow. One screen per finding, with the context pane filling
+the terminal, word wrap on by default, and a vim-style statusline (repo,
+forge, commit, `i/n`, undecided count, mode, wrap, scroll position):
 
 | key | action |
 |---|---|
@@ -71,8 +65,13 @@ p port · s skip · d delete · o view · e select · j/k nav · c confirm · ? 
 | `s` / `d` | skip / delete (delete removes the comment without creating an issue) |
 | `x` | clear the decision for this finding |
 | `o` | open the file read-only in `$EDITOR` at the comment line (vim-family editors get `-R +line`) |
-| `e` | edit the selected comment range: `←` shrink, `→` grow, `r` reset, `esc` done — for detaching attached comments |
-| `j`/`k` | next / previous finding |
+| `e` | edit the selected comment range (`[` grow up, `]` grow down, `{` shrink up, `}` shrink down, `r` reset, `esc` done) |
+| `Ctrl-n` / `Ctrl-p` | next / previous finding |
+| `j`/`k` (+`↓`/`↑`) | scroll the context · `h`/`l` (+`←`/`→`) pan horizontally |
+| `Ctrl-d`/`Ctrl-u`, `Ctrl-f`/`Ctrl-b` | half page / full page scroll |
+| `g` / `G` | top / bottom of the context |
+| `z` | center the comment in the pane |
+| `w` | toggle word wrap |
 | `c` | confirmation screen: `y` execute, `b` back to review |
 | `q` | quit (nothing is created or removed) |
 
@@ -169,6 +168,7 @@ case_sensitive = false           # "todo" matches "TODO" ({marker} only)
 [context]
 before = 3                       # context lines before a finding
 after = 3                        # context lines after a finding
+wrap = true                      # word-wrap context lines in the TUI (w toggles)
 
 [forge]
 kind = "github"                  # v1 only; the Forge trait is the seam

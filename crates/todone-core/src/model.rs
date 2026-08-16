@@ -137,24 +137,33 @@ impl Finding {
         self.run.comments[self.primary].line
     }
 
-    /// Grows the selection by one comment, preferring to extend the end and
-    /// falling back to the start. Never exceeds the run.
-    pub fn grow_selection(&mut self) {
-        let len = self.run.comments.len();
-        if self.selection.end + 1 < len {
-            self.selection.end += 1;
-        } else if self.selection.start > 0 {
+    /// Grows the selection upward by one comment (never past the run).
+    pub fn grow_selection_top(&mut self) {
+        if self.selection.start > 0 {
             self.selection.start -= 1;
         }
     }
 
-    /// Shrinks the selection by one comment, from the side away from the
-    /// primary comment, which always stays selected.
-    pub fn shrink_selection(&mut self) {
-        let primary = self.primary;
-        if self.selection.start < primary {
+    /// Grows the selection downward by one comment (never past the run).
+    pub fn grow_selection_bottom(&mut self) {
+        let len = self.run.comments.len();
+        if self.selection.end + 1 < len {
+            self.selection.end += 1;
+        }
+    }
+
+    /// Shrinks the selection from the top by one comment; the primary
+    /// comment always stays selected.
+    pub fn shrink_selection_top(&mut self) {
+        if self.selection.start < self.primary {
             self.selection.start += 1;
-        } else if self.selection.end > primary {
+        }
+    }
+
+    /// Shrinks the selection from the bottom by one comment; the primary
+    /// comment always stays selected.
+    pub fn shrink_selection_bottom(&mut self) {
+        if self.selection.end > self.primary {
             self.selection.end -= 1;
         }
     }
@@ -235,6 +244,7 @@ mod tests {
         let run = CommentRun {
             comments: vec![comment(0, 10), comment(11, 20), comment(21, 30)],
         };
+        // The primary is the middle comment.
         let mut finding = Finding {
             run: run.clone(),
             category: "TODO".into(),
@@ -242,29 +252,35 @@ mod tests {
             selection: Selection { start: 0, end: 2 },
         };
 
-        // Growing past the end moves the start instead.
-        finding.grow_selection();
+        // Growing is bounded by the run.
+        finding.grow_selection_top();
+        assert_eq!((finding.selection.start, finding.selection.end), (0, 2));
+        finding.grow_selection_bottom();
         assert_eq!((finding.selection.start, finding.selection.end), (0, 2));
 
-        // Shrink from the side away from the primary.
-        finding.shrink_selection();
+        // Shrink from the top.
+        finding.shrink_selection_top();
         assert_eq!((finding.selection.start, finding.selection.end), (1, 2));
-        finding.shrink_selection();
+        // Shrink from the bottom.
+        finding.shrink_selection_bottom();
         assert_eq!((finding.selection.start, finding.selection.end), (1, 1));
 
         // The primary always stays selected.
-        finding.shrink_selection();
+        finding.shrink_selection_top();
+        finding.shrink_selection_bottom();
         assert_eq!((finding.selection.start, finding.selection.end), (1, 1));
 
-        // A smaller run grows the end first.
+        // A smaller run grows both directions.
         let mut finding = Finding {
             run,
             category: "TODO".into(),
-            primary: 0,
-            selection: Selection { start: 0, end: 0 },
+            primary: 1,
+            selection: Selection { start: 1, end: 1 },
         };
-        finding.grow_selection();
+        finding.grow_selection_top();
         assert_eq!((finding.selection.start, finding.selection.end), (0, 1));
+        finding.grow_selection_bottom();
+        assert_eq!((finding.selection.start, finding.selection.end), (0, 2));
 
         finding.reset_selection();
         assert_eq!((finding.selection.start, finding.selection.end), (0, 2));

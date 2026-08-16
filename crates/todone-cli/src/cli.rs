@@ -42,6 +42,12 @@ pub struct CommonScanArgs {
     /// Context lines before each finding (grep -B).
     #[arg(short = 'B', long)]
     pub before: Option<usize>,
+    /// Word-wrap context lines in the interactive review (default on).
+    #[arg(long, conflicts_with = "no_wrap")]
+    pub wrap: bool,
+    /// Do not word-wrap context lines.
+    #[arg(long, conflicts_with = "wrap")]
+    pub no_wrap: bool,
     /// Comma-separated marker categories, e.g. `TODO,FIXME,PERF`.
     #[arg(long)]
     pub pattern: Option<String>,

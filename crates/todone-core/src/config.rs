@@ -55,6 +55,8 @@ pub struct ContextConfig {
     pub before: usize,
     /// Lines of context after the finding.
     pub after: usize,
+    /// Word-wrap long context lines in the TUI (toggleable with `w`).
+    pub wrap: bool,
 }
 
 /// Issue-tracking backend selection.
@@ -83,6 +85,7 @@ impl Default for Config {
             context: ContextConfig {
                 before: 3,
                 after: 3,
+                wrap: true,
             },
             forge: ForgeConfig {
                 kind: "github".into(),
@@ -211,6 +214,9 @@ impl Config {
         if let Some(after) = overrides.context_after {
             self.context.after = after;
         }
+        if let Some(wrap) = overrides.wrap {
+            self.context.wrap = wrap;
+        }
         if let Some(kind) = &overrides.forge {
             self.forge.kind = kind.clone();
         }
@@ -300,6 +306,8 @@ case_sensitive = false
 # Context lines around each finding, like grep -A/-B.
 before = 3
 after = 3
+# Word-wrap long context lines in the interactive review (toggle with `w`).
+wrap = true
 
 [forge]
 # Issue-tracking backend: "github" (v1, via the gh CLI).
@@ -413,6 +421,8 @@ pub struct CliOverrides {
     pub context_before: Option<usize>,
     /// `-B`.
     pub context_after: Option<usize>,
+    /// `--wrap` / `--no-wrap`.
+    pub wrap: Option<bool>,
     /// `--forge`.
     pub forge: Option<String>,
     /// `--editor`.

@@ -2340,6 +2340,7 @@ dependencies = [
  "todone-forge",
  "tree-sitter",
  "tree-sitter-highlight",
+ "unicode-width",
 ]
 
 [[package]]

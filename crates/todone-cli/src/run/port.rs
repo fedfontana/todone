@@ -621,10 +621,11 @@ mod tests {
                 repo: todone_core::repo::no_repo(std::env::temp_dir()),
             },
         );
-        use ratatui::crossterm::event::KeyCode::Char;
-        app.handle_key(Char('s'));
-        app.handle_key(Char('s'));
+        use ratatui::crossterm::event::{KeyCode::Char, KeyEvent, KeyModifiers};
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(press(Char('s')));
+        app.handle_key(press(Char('s')));
         assert_eq!(app.mode, crate::tui::Mode::Confirm);
-        assert_eq!(app.handle_key(Char('y')), AppAction::Execute);
+        assert_eq!(app.handle_key(press(Char('y'))), AppAction::Execute);
     }
 }

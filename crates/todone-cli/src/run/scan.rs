@@ -27,6 +27,7 @@ pub fn overrides(args: &CommonScanArgs) -> CliOverrides {
         max_file_bytes: args.max_file_bytes,
         context_before: args.before,
         context_after: args.after,
+        wrap: flag(args.wrap, args.no_wrap),
         ..Default::default()
     }
 }

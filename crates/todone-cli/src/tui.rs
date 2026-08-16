@@ -1,6 +1,12 @@
 //! The interactive ratatui review: one screen per finding plus a confirm
 //! screen, driven by the core session state machine.
 //!
+//! The context pane fills the available terminal height, wraps long lines
+//! (toggleable with `w`), and scrolls less/bat-style (`j`/`k`, `h`/`l`,
+//! `Ctrl-d/u`, `Ctrl-f/b`, `g`/`G`, `z` to center the comment). Findings
+//! are navigated with `Ctrl-n`/`Ctrl-p`; the statusline shows the repo,
+//! forge, commit, and session stats.
+//!
 //! The app is terminal-agnostic: it renders to any `ratatui::Terminal`
 //! (crossterm in production, `TestBackend` in tests) and processes
 //! crossterm events through [`PortApp::handle_key`].
@@ -9,12 +15,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use todone_core::draft::{ContextSnippet, IssueDraft};
 use todone_core::model::Finding;
 use todone_core::session::{Decision, Session};
+use unicode_width::UnicodeWidthStr;
 
-use crate::context::extract_context;
+use crate::context::{Context, LineKind, extract_context};
 use crate::editor::edit_draft;
 use crate::highlight::HighlightEngine;
 use crate::run::scan::ScanContext;
@@ -45,11 +52,9 @@ pub enum AppAction {
 pub struct PortApp {
     /// The core session (findings + decisions + cursor).
     pub session: Session,
-    /// Context windows per finding index.
-    pub contexts: Vec<crate::context::Context>,
     /// The current screen.
     pub mode: Mode,
-    /// Transient status message shown in the footer.
+    /// Transient status message shown in the hints line.
     pub message: Option<String>,
     /// Whether the help overlay is open.
     pub show_help: bool,
@@ -58,6 +63,23 @@ pub struct PortApp {
     /// When set, quitting the review executes instead of aborting, and the
     /// confirm screen is skipped once everything is decided (`--yes`).
     pub auto_confirm: bool,
+    /// Word wrap on the context pane.
+    pub wrap: bool,
+    /// Vertical scroll offset (rendered rows) of the context pane.
+    pub v_scroll: usize,
+    /// Horizontal scroll offset (characters; only visible without wrap).
+    pub h_scroll: usize,
+    /// Repo basename for the statusline.
+    pub repo_name: String,
+    /// Forge kind for the statusline.
+    pub forge: String,
+    /// Short commit hash for the statusline.
+    pub commit: String,
+    /// Scroll label for the statusline, computed each frame.
+    pub scroll_label: String,
+    /// The context pane size from the last frame.
+    pub pane_height: usize,
+    pub pane_width: usize,
     /// Cached sources per repository-relative path.
     sources: HashMap<PathBuf, String>,
     /// Cached highlight spans per repository-relative path.
@@ -65,7 +87,7 @@ pub struct PortApp {
     engine: HighlightEngine,
     /// Repository root, for reads and editors.
     pub root: PathBuf,
-    /// Context configuration (before/after).
+    /// The config context window (before/after), used for draft snippets.
     pub context_lines: (usize, usize),
 }
 
@@ -73,36 +95,40 @@ impl PortApp {
     /// Builds the app for a session over the scanned findings.
     pub fn new(session: Session, ctx: &ScanContext) -> Self {
         let (before, after) = (ctx.config.context.before, ctx.config.context.after);
-        let mut app = Self {
+        let repo_name = ctx
+            .repo
+            .root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ctx.repo.root.display().to_string());
+        let commit = ctx
+            .repo
+            .commit
+            .as_deref()
+            .map(|c| c[..c.len().min(8)].to_string())
+            .unwrap_or_else(|| "none".to_string());
+        Self {
             session,
-            contexts: Vec::new(),
             mode: Mode::Review,
             message: None,
             show_help: false,
             dry_run: false,
             auto_confirm: false,
+            wrap: ctx.config.context.wrap,
+            v_scroll: 0,
+            h_scroll: 0,
+            repo_name,
+            forge: ctx.config.forge.kind.clone(),
+            commit,
+            scroll_label: "TOP".into(),
+            pane_height: 0,
+            pane_width: 0,
             sources: HashMap::new(),
             spans: HashMap::new(),
             engine: HighlightEngine::new(),
             root: ctx.repo.root.clone(),
             context_lines: (before, after),
-        };
-        app.refresh_contexts();
-        app
-    }
-
-    /// Recomputes context windows for every finding (also picks up
-    /// selection edits).
-    pub fn refresh_contexts(&mut self) {
-        let (before, after) = self.context_lines;
-        let findings: Vec<Finding> = self.session.findings.clone();
-        self.contexts = findings
-            .iter()
-            .map(|finding| {
-                let source = self.source_of(finding).to_string();
-                extract_context(&source, finding, before, after)
-            })
-            .collect();
+        }
     }
 
     /// The cached source text of a finding's file.
@@ -139,27 +165,191 @@ impl PortApp {
         self.session.findings.get_mut(cursor)
     }
 
+    /// The context window for the finding at `cursor`, sized to fill a pane
+    /// of `pane_height` rows (centered on the finding).
+    fn context_for_finding(&mut self, cursor: usize, pane_height: usize) -> Context {
+        let Some(finding) = self.session.findings.get(cursor).cloned() else {
+            return Context {
+                lines: Vec::new(),
+                selection: 0..0,
+            };
+        };
+        let source = self.source_of(&finding).to_string();
+        let (before, after) = (pane_height / 2, pane_height - pane_height / 2);
+        extract_context(&source, &finding, before, after)
+    }
+
+    /// The context pane plus the rendered row count of each line and the
+    /// total height.
+    fn view(&mut self, pane_height: usize, pane_width: usize) -> (Context, Vec<usize>, usize) {
+        let context = self.context_for_finding(self.session.cursor(), pane_height);
+        let rows: Vec<usize> = context
+            .lines
+            .iter()
+            .map(|line| rendered_rows(&line.text, pane_width, self.wrap))
+            .collect();
+        let total = rows.iter().sum();
+        (context, rows, total)
+    }
+
+    /// Scrolls the context pane by `delta` rendered rows, clamped.
+    fn scroll_lines(&mut self, delta: isize) {
+        let (_, _, total) = self.view(self.pane_height, self.pane_width);
+        let max = total.saturating_sub(self.pane_height);
+        self.v_scroll = (self.v_scroll as isize + delta).clamp(0, max as isize) as usize;
+    }
+
+    /// Moves the cursor by `delta` findings, resetting the scroll offsets.
+    fn navigate(&mut self, delta: isize) {
+        self.session.navigate(delta);
+        self.v_scroll = 0;
+        self.h_scroll = 0;
+    }
+
+    /// Centers the viewport on the selected comment range (vim `zz`).
+    fn center_comment(&mut self) {
+        let (context, rows, total) = self.view(self.pane_height, self.pane_width);
+        let mut selected_start = None;
+        let mut selected_end = 0;
+        let mut y = 0;
+        for (line, count) in context.lines.iter().zip(&rows) {
+            let start = y;
+            y += count;
+            if line.kind == LineKind::Selected {
+                selected_start.get_or_insert(start);
+                selected_end = y;
+            }
+        }
+        let Some(start) = selected_start else { return };
+        let center = (start + selected_end) / 2;
+        let max = total.saturating_sub(self.pane_height);
+        self.v_scroll = center.saturating_sub(self.pane_height / 2).min(max);
+    }
+
+    /// Toggles word wrap, resetting the horizontal pan.
+    fn toggle_wrap(&mut self) {
+        self.wrap = !self.wrap;
+        if self.wrap {
+            self.h_scroll = 0;
+        }
+        self.message = Some(
+            if self.wrap {
+                "word wrap on"
+            } else {
+                "word wrap off"
+            }
+            .into(),
+        );
+    }
+
+    /// The scroll indicator for the statusline.
+    fn scroll_label(&mut self) -> String {
+        let (_, _, total) = self.view(self.pane_height, self.pane_width);
+        if self.pane_height == 0 || total <= self.pane_height {
+            "ALL".into()
+        } else if self.v_scroll == 0 {
+            "TOP".into()
+        } else {
+            let max = total - self.pane_height;
+            if self.v_scroll >= max {
+                "BOT".into()
+            } else {
+                format!("{}%", self.v_scroll * 100 / max)
+            }
+        }
+    }
+
     /// Handles one key, mutating state and returning the app action.
-    pub fn handle_key(&mut self, key: ratatui::crossterm::event::KeyCode) -> AppAction {
+    pub fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> AppAction {
         if self.show_help {
-            if key == ratatui::crossterm::event::KeyCode::Esc
-                || key == ratatui::crossterm::event::KeyCode::Char('?')
-                || key == ratatui::crossterm::event::KeyCode::Char('q')
-            {
+            if matches!(
+                key.code,
+                ratatui::crossterm::event::KeyCode::Esc
+                    | ratatui::crossterm::event::KeyCode::Char('?')
+                    | ratatui::crossterm::event::KeyCode::Char('q')
+            ) {
                 self.show_help = false;
             }
             return AppAction::Continue;
         }
         match self.mode {
-            Mode::SelectionEdit => self.handle_selection_key(key),
-            Mode::Confirm => self.handle_confirm_key(key),
-            Mode::Review => self.handle_review_key(key),
+            Mode::SelectionEdit => self.handle_selection_key(&key),
+            Mode::Confirm => self.handle_confirm_key(&key),
+            Mode::Review => self.handle_review_key(&key),
         }
     }
 
-    fn handle_review_key(&mut self, key: ratatui::crossterm::event::KeyCode) -> AppAction {
-        use ratatui::crossterm::event::KeyCode::{Char, Down, Esc, Up};
-        match key {
+    /// The keys shared by the review and selection screens: scrolling,
+    /// panning, and finding navigation. Returns `Some` when handled.
+    fn handle_nav_key(&mut self, key: &ratatui::crossterm::event::KeyEvent) -> Option<AppAction> {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                self.navigate(1);
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                self.navigate(-1);
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
+                self.scroll_lines(1);
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+                self.scroll_lines(-1);
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('h'), _) | (KeyCode::Left, _) => {
+                self.h_scroll = self.h_scroll.saturating_sub(1);
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
+                self.h_scroll += 1;
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                self.scroll_lines((self.pane_height as isize) / 2);
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                self.scroll_lines(-((self.pane_height as isize) / 2));
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                self.scroll_lines(self.pane_height as isize);
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                self.scroll_lines(-(self.pane_height as isize));
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('g'), _) => {
+                self.v_scroll = 0;
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('G'), _) => {
+                self.scroll_lines(isize::MAX);
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('z'), _) => {
+                self.center_comment();
+                Some(AppAction::Continue)
+            }
+            (KeyCode::Char('w'), _) => {
+                self.toggle_wrap();
+                Some(AppAction::Continue)
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_review_key(&mut self, key: &ratatui::crossterm::event::KeyEvent) -> AppAction {
+        use ratatui::crossterm::event::KeyCode::{Char, Esc};
+        if let Some(action) = self.handle_nav_key(key) {
+            return action;
+        }
+        match key.code {
             Char('p') => AppAction::Continue, // handled by the caller (editor session)
             Char('o') => AppAction::Continue, // handled by the caller (read-only view)
             Char('s') => {
@@ -178,14 +368,6 @@ impl PortApp {
             }
             Char('e') => {
                 self.mode = Mode::SelectionEdit;
-                AppAction::Continue
-            }
-            Char('j') | Down => {
-                self.session.navigate(1);
-                AppAction::Continue
-            }
-            Char('k') | Up => {
-                self.session.navigate(-1);
                 AppAction::Continue
             }
             Char('c') => {
@@ -207,27 +389,39 @@ impl PortApp {
         }
     }
 
-    fn handle_selection_key(&mut self, key: ratatui::crossterm::event::KeyCode) -> AppAction {
-        use ratatui::crossterm::event::KeyCode::{Char, Down, Esc, Left, Right, Up};
-        match key {
-            Left => {
+    fn handle_selection_key(&mut self, key: &ratatui::crossterm::event::KeyEvent) -> AppAction {
+        use ratatui::crossterm::event::KeyCode::{Char, Esc};
+        if let Some(action) = self.handle_nav_key(key) {
+            return action;
+        }
+        match key.code {
+            Char('[') => {
                 if let Some(finding) = self.current_mut() {
-                    finding.shrink_selection();
-                    self.refresh_contexts();
+                    finding.grow_selection_top();
                 }
                 AppAction::Continue
             }
-            Right => {
+            Char(']') => {
                 if let Some(finding) = self.current_mut() {
-                    finding.grow_selection();
-                    self.refresh_contexts();
+                    finding.grow_selection_bottom();
+                }
+                AppAction::Continue
+            }
+            Char('{') => {
+                if let Some(finding) = self.current_mut() {
+                    finding.shrink_selection_top();
+                }
+                AppAction::Continue
+            }
+            Char('}') => {
+                if let Some(finding) = self.current_mut() {
+                    finding.shrink_selection_bottom();
                 }
                 AppAction::Continue
             }
             Char('r') => {
                 if let Some(finding) = self.current_mut() {
                     finding.reset_selection();
-                    self.refresh_contexts();
                 }
                 AppAction::Continue
             }
@@ -235,21 +429,13 @@ impl PortApp {
                 self.mode = Mode::Review;
                 AppAction::Continue
             }
-            Char('j') | Down => {
-                self.session.navigate(1);
-                AppAction::Continue
-            }
-            Char('k') | Up => {
-                self.session.navigate(-1);
-                AppAction::Continue
-            }
             _ => AppAction::Continue,
         }
     }
 
-    fn handle_confirm_key(&mut self, key: ratatui::crossterm::event::KeyCode) -> AppAction {
+    fn handle_confirm_key(&mut self, key: &ratatui::crossterm::event::KeyEvent) -> AppAction {
         use ratatui::crossterm::event::KeyCode::{Char, Esc};
-        match key {
+        match key.code {
             Char('y') => AppAction::Execute,
             Char('b') | Char('q') | Esc => {
                 self.mode = Mode::Review;
@@ -311,17 +497,21 @@ impl PortApp {
     }
 
     /// The snippet for the current finding, as embedded in drafts.
-    pub fn current_snippet(&self) -> Option<ContextSnippet> {
-        let finding = self.current()?;
-        let context = self.contexts.get(self.session.cursor())?;
+    ///
+    /// Surrounding code only: the selected comment lines do not belong in
+    /// the issue.
+    pub fn current_snippet(&mut self) -> Option<ContextSnippet> {
+        let cursor = self.session.cursor();
+        let finding = self.session.findings.get(cursor).cloned()?;
+        let (before, after) = self.context_lines;
+        let source = self.source_of(&finding).to_string();
+        let context = extract_context(&source, &finding, before, after);
         let primary = &finding.run.comments[finding.primary];
-        // Surrounding code only: the comment lines themselves do not belong
-        // in the issue.
         let lines: Vec<&str> = context
             .lines
             .iter()
-            .filter(|l| l.kind != crate::context::LineKind::Selected)
-            .map(|l| l.text.as_str())
+            .filter(|line| line.kind != LineKind::Selected)
+            .map(|line| line.text.as_str())
             .collect();
         let text = if lines.is_empty() {
             "(no surrounding context)".to_string()
@@ -333,6 +523,31 @@ impl PortApp {
             text,
         })
     }
+}
+
+/// The number of display rows a context line occupies at `width`.
+fn rendered_rows(text: &str, width: usize, wrap: bool) -> usize {
+    if !wrap || width == 0 {
+        return 1;
+    }
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let word_width = UnicodeWidthStr::width(word);
+        if word_width >= width {
+            // A word wider than the pane spans multiple rows by itself.
+            rows += word_width / width;
+            col = word_width % width;
+            continue;
+        }
+        if col > 0 && col + 1 + word_width > width {
+            rows += 1;
+            col = word_width;
+        } else {
+            col += if col == 0 { word_width } else { 1 + word_width };
+        }
+    }
+    rows
 }
 
 /// Renders the whole app into a frame.
@@ -355,11 +570,14 @@ fn render_help(frame: &mut ratatui::Frame) {
         Line::from("d  delete the comment without creating an issue"),
         Line::from("x  clear the decision for this finding"),
         Line::from("e  edit the selected comment range"),
-        Line::from("j/k  next / previous finding"),
+        Line::from("Ctrl-n / Ctrl-p  next / previous finding"),
+        Line::from("j / k  scroll · h / l  pan · g / G  top / bottom · z  center"),
+        Line::from("Ctrl-d/u  half page · Ctrl-f/b  full page · w  toggle wrap"),
         Line::from("c  go to the confirmation screen"),
         Line::from("q  quit (no changes)"),
         Line::from(""),
-        Line::from("selection editing: ← shrink · → grow · r reset · esc done"),
+        Line::from("selection editing: [ grow up · ] grow down · { shrink up · } shrink down"),
+        Line::from("                   r reset · esc done"),
         Line::from("confirmation:      y execute · b back to review"),
     ];
     let paragraph = Paragraph::new(help).block(
@@ -374,15 +592,17 @@ fn render_review(frame: &mut ratatui::Frame, app: &mut PortApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
             Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(frame.area());
 
     render_header(frame, chunks[0], app);
     render_context_area(frame, chunks[1], app);
-    render_footer(frame, chunks[2], app);
+    render_statusline(frame, chunks[2], app);
+    render_hints(frame, chunks[3], app);
 }
 
 fn render_header(frame: &mut ratatui::Frame, area: Rect, app: &PortApp) {
@@ -420,30 +640,20 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, app: &PortApp) {
         format!("  ({} undecided)", app.session.undecided_count()),
         Style::default().fg(Color::DarkGray),
     ));
-    line.spans.push(Span::styled(
-        format!("\n repo: {}", app.root.display()),
-        Style::default().fg(Color::DarkGray),
-    ));
     frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Converts the context window into styled ratatui lines.
-fn context_lines(app: &mut PortApp) -> Vec<Line<'static>> {
-    let cursor = app.session.cursor();
-    let finding = app.session.findings.get(cursor).cloned();
-    let Some(finding) = finding else {
+fn context_to_lines(app: &mut PortApp, context: &Context) -> Vec<Line<'static>> {
+    let Some(finding) = app.session.findings.get(app.session.cursor()).cloned() else {
         return Vec::new();
     };
-    let context = app.contexts.get(cursor).cloned();
-    let Some(context) = context else {
-        return Vec::new();
-    };
-    let selection = finding.selected_range();
+    let selection = context.selection.clone();
     let spans = app.spans_of(&finding);
     let width = context
         .lines
         .iter()
-        .map(|l| l.line.to_string().len())
+        .map(|line| line.line.to_string().len())
         .max()
         .unwrap_or(1);
 
@@ -489,17 +699,90 @@ fn context_lines(app: &mut PortApp) -> Vec<Line<'static>> {
 }
 
 fn render_context_area(frame: &mut ratatui::Frame, area: Rect, app: &mut PortApp) {
-    let lines = context_lines(app);
-    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+    let height = area.height as usize;
+    let width = area.width as usize;
+    app.pane_height = height;
+    app.pane_width = width;
+    let (context, _, total) = app.view(height, width);
+
+    let max = total.saturating_sub(height);
+    if app.v_scroll > max {
+        app.v_scroll = max;
+    }
+    app.scroll_label = app.scroll_label();
+
+    let lines = context_to_lines(app, &context);
+    let mut paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL))
+        .scroll((app.v_scroll as u16, app.h_scroll as u16));
+    if app.wrap {
+        paragraph = paragraph.wrap(Wrap { trim: false });
+    }
     frame.render_widget(paragraph, area);
 }
 
-fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &PortApp) {
+/// The vim-style statusline: repo, forge, commit, and session stats.
+fn render_statusline(frame: &mut ratatui::Frame, area: Rect, app: &PortApp) {
+    let Some(finding) = app.current() else {
+        return;
+    };
+    let primary = &finding.run.comments[finding.primary];
+    let mode = match app.mode {
+        Mode::Review => "NORMAL",
+        Mode::SelectionEdit => "SELECT",
+        Mode::Confirm => "CONFIRM",
+    };
+    let wrap = if app.wrap { "wrap" } else { "nowrap" };
+    let left = format!(
+        " {} ({}) · {}:{} · {}",
+        app.repo_name,
+        app.forge,
+        primary.path.display(),
+        finding.line(),
+        app.commit
+    );
+    let mut right = format!(
+        " {}/{} · {}u · {} · {} · {}",
+        app.session.cursor() + 1,
+        app.session.len(),
+        app.session.undecided_count(),
+        mode,
+        wrap,
+        app.scroll_label
+    );
+    if app.dry_run {
+        right.push_str(" · dry-run");
+    }
+    let width = area.width as usize;
+    let text = fit_status(&left, &right, width);
+    let line = Line::from(Span::styled(
+        text,
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Fits a left/right statusline pair into `width`, truncating the left side
+/// when necessary.
+fn fit_status(left: &str, right: &str, width: usize) -> String {
+    let left_len = left.chars().count();
+    let right_len = right.chars().count();
+    if left_len + right_len <= width {
+        let pad = width - left_len - right_len;
+        format!("{left}{:pad$}{right}", "", pad = pad)
+    } else {
+        let keep = width.saturating_sub(right_len + 1);
+        let truncated: String = left.chars().take(keep).collect();
+        format!("{truncated}…{right}")
+    }
+}
+
+fn render_hints(frame: &mut ratatui::Frame, area: Rect, app: &PortApp) {
     let mode_hint = match app.mode {
         Mode::Review => {
-            "p port · s skip · d delete · o view · e select · j/k nav · c confirm · ? help · q quit"
+            "p port · s skip · d delete · o view · e select · Ctrl-n/p nav · c confirm · ? help · q quit"
         }
-        Mode::SelectionEdit => "← shrink · → grow · r reset · j/k nav · esc done",
+        Mode::SelectionEdit => "[ ] grow · { } shrink · r reset · esc done",
         Mode::Confirm => "y execute · b back · q quit",
     };
     let mut text = mode_hint.to_string();
@@ -627,45 +910,49 @@ pub fn run_interactive(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        let action = match key.code {
-            KeyCode::Char('p') => {
-                let draft = app.prefilled_draft();
-                let snippet = app.current_snippet();
-                let Some(draft) = draft else {
-                    app.message = Some("nothing to port here".into());
-                    continue;
-                };
-                let Some(snippet) = snippet else {
-                    continue;
-                };
-                match suspend(&mut terminal, || edit_draft(editor, &draft, &snippet))? {
-                    crate::editor::DraftOutcome::Drafted(draft) => {
-                        app.session
-                            .set_current_decision(todone_core::session::Decision::Port(draft));
-                        app.message = Some("drafted; s/d/x can change this decision".into());
+        // The editor-bound keys only apply on the review screen.
+        if app.mode == Mode::Review {
+            match key.code {
+                KeyCode::Char('p') => {
+                    let draft = app.prefilled_draft();
+                    let snippet = app.current_snippet();
+                    let Some(draft) = draft else {
+                        app.message = Some("nothing to port here".into());
+                        continue;
+                    };
+                    let Some(snippet) = snippet else {
+                        continue;
+                    };
+                    match suspend(&mut terminal, || edit_draft(editor, &draft, &snippet))? {
+                        crate::editor::DraftOutcome::Drafted(draft) => {
+                            app.session
+                                .set_current_decision(todone_core::session::Decision::Port(draft));
+                            app.message = Some("drafted; s/d/x can change this decision".into());
+                        }
+                        crate::editor::DraftOutcome::Aborted => {
+                            app.message = Some("draft aborted; nothing changed".into());
+                        }
                     }
-                    crate::editor::DraftOutcome::Aborted => {
-                        app.message = Some("draft aborted; nothing changed".into());
-                    }
-                }
-                continue;
-            }
-            KeyCode::Char('o') => {
-                let Some(finding) = app.session.current() else {
                     continue;
-                };
-                let path = finding.path().to_path_buf();
-                let line = finding.line();
-                match suspend(&mut terminal, || {
-                    editor.view_readonly(&app.root, &path, line)
-                }) {
-                    Ok(()) => app.message = Some("read-only view closed".into()),
-                    Err(err) => app.message = Some(format!("editor failed: {err}")),
                 }
-                continue;
+                KeyCode::Char('o') => {
+                    let Some(finding) = app.session.current() else {
+                        continue;
+                    };
+                    let path = finding.path().to_path_buf();
+                    let line = finding.line();
+                    match suspend(&mut terminal, || {
+                        editor.view_readonly(&app.root, &path, line)
+                    }) {
+                        Ok(()) => app.message = Some("read-only view closed".into()),
+                        Err(err) => app.message = Some(format!("editor failed: {err}")),
+                    }
+                    continue;
+                }
+                _ => {}
             }
-            other => app.handle_key(other),
-        };
+        }
+        let action = app.handle_key(key);
         match action {
             AppAction::Continue => {}
             done @ (AppAction::Execute | AppAction::Quit) => break done,
@@ -702,7 +989,16 @@ fn suspend<R>(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use todone_core::model::{Comment, CommentRun, Selection};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
 
     fn finding(line: usize, end_line: usize) -> Finding {
         Finding {
@@ -729,7 +1025,7 @@ mod tests {
         std::fs::write(dir.path().join("src/a.rs"), "// TODO: x\n").unwrap();
         let repo = todone_core::repo::RepoInfo {
             root: dir.path().to_path_buf(),
-            commit: Some("abc".into()),
+            commit: Some("abcdef1234567890".into()),
             is_repo: true,
             remote: None,
         };
@@ -745,16 +1041,6 @@ mod tests {
         let (ctx, _dir) = ctx_for(finding(1, 1));
         let session = Session::new(vec![finding(1, 1)], "abc".into());
         let mut app = PortApp::new(session, &ctx);
-
-        // The context window itself must contain the comment text.
-        let rendered_lines = context_lines(&mut app);
-        assert_eq!(rendered_lines.len(), 1, "expected one context line");
-        let text: String = rendered_lines[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert!(text.contains("// TODO: x"), "comment missing: {text:?}");
 
         let backend = TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -773,19 +1059,47 @@ mod tests {
     }
 
     #[test]
-    fn keys_make_decisions_and_navigate() {
+    fn statusline_shows_repo_forge_and_stats() {
+        let (ctx, _dir) = ctx_for(finding(1, 1));
+        let mut app = PortApp::new(Session::new(vec![finding(1, 1)], "abc".into()), &ctx);
+        app.dry_run = true;
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("NORMAL"), "mode missing:\n{content}");
+        assert!(content.contains("github"), "forge missing:\n{content}");
+        assert!(content.contains("abcdef12"), "commit missing:\n{content}");
+        assert!(content.contains("wrap"), "wrap marker missing:\n{content}");
+        assert!(content.contains("dry-run"), "dry-run missing:\n{content}");
+        assert!(
+            content.contains("1u"),
+            "undecided count missing:\n{content}"
+        );
+    }
+
+    #[test]
+    fn ctrl_navigation_and_decisions() {
         let (ctx, _dir) = ctx_for(finding(1, 1));
         let mut app = PortApp::new(
             Session::new(vec![finding(1, 1), finding(2, 2)], "abc".into()),
             &ctx,
         );
-        use ratatui::crossterm::event::KeyCode::{Char, Down};
-        assert_eq!(app.handle_key(Char('s')), AppAction::Continue);
+        assert_eq!(app.handle_key(key(KeyCode::Char('s'))), AppAction::Continue);
         assert_eq!(*app.session.decision(0).unwrap(), Decision::Skip);
         assert_eq!(app.session.cursor(), 1);
-        assert_eq!(app.handle_key(Down), AppAction::Continue);
+        assert_eq!(
+            app.handle_key(ctrl(KeyCode::Char('p'))),
+            AppAction::Continue
+        );
+        assert_eq!(app.session.cursor(), 0);
+        assert_eq!(
+            app.handle_key(ctrl(KeyCode::Char('n'))),
+            AppAction::Continue
+        );
         assert_eq!(app.session.cursor(), 1);
-        assert_eq!(app.handle_key(Char('q')), AppAction::Quit);
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), AppAction::Quit);
     }
 
     #[test]
@@ -795,11 +1109,10 @@ mod tests {
             Session::new(vec![finding(1, 1), finding(2, 2)], "abc".into()),
             &ctx,
         );
-        use ratatui::crossterm::event::KeyCode::Char;
-        app.handle_key(Char('s'));
-        app.handle_key(Char('s'));
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Char('s')));
         assert_eq!(app.mode, Mode::Confirm);
-        assert_eq!(app.handle_key(Char('y')), AppAction::Execute);
+        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), AppAction::Execute);
     }
 
     #[test]
@@ -821,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_editing_updates_the_range() {
+    fn selection_editing_moves_top_and_bottom() {
         let run = CommentRun {
             comments: vec![
                 Comment {
@@ -842,30 +1155,137 @@ mod tests {
                     text: "// note: b".into(),
                     language: "rust".into(),
                 },
+                Comment {
+                    path: "a.rs".into(),
+                    line: 3,
+                    end_line: 3,
+                    column: 0,
+                    byte_range: 25..39,
+                    text: "// note: c".into(),
+                    language: "rust".into(),
+                },
             ],
         };
+        // Primary is the middle comment, selection covers all three.
         let f = Finding {
             run,
             category: "TODO".into(),
-            primary: 0,
-            selection: Selection::full(2),
+            primary: 1,
+            selection: Selection::full(3),
         };
         let (ctx, _dir) = ctx_for(finding(1, 1));
         let mut app = PortApp::new(Session::new(vec![f], "abc".into()), &ctx);
         app.mode = Mode::SelectionEdit;
-        use ratatui::crossterm::event::KeyCode::{Char, Left, Right};
-        app.handle_key(Left);
+
+        // Grow and shrink in both directions.
+        app.handle_key(key(KeyCode::Char('[')));
         let sel = app.current().unwrap().selection;
-        assert_eq!((sel.start, sel.end), (0, 0));
-        app.handle_key(Left);
+        assert_eq!((sel.start, sel.end), (0, 2), "grow up at the run edge");
+
+        app.handle_key(key(KeyCode::Char('}')));
         let sel = app.current().unwrap().selection;
-        assert_eq!((sel.start, sel.end), (0, 0));
-        app.handle_key(Right);
+        assert_eq!((sel.start, sel.end), (0, 1), "shrink down");
+
+        app.handle_key(key(KeyCode::Char('{')));
         let sel = app.current().unwrap().selection;
-        assert_eq!((sel.start, sel.end), (0, 1));
-        app.handle_key(Char('r'));
+        assert_eq!((sel.start, sel.end), (1, 1), "shrink up to the primary");
+
+        // The primary never leaves the selection.
+        app.handle_key(key(KeyCode::Char('{')));
         let sel = app.current().unwrap().selection;
-        assert_eq!((sel.start, sel.end), (0, 1));
+        assert_eq!((sel.start, sel.end), (1, 1));
+
+        app.handle_key(key(KeyCode::Char(']')));
+        let sel = app.current().unwrap().selection;
+        assert_eq!((sel.start, sel.end), (1, 2), "grow down");
+
+        app.handle_key(key(KeyCode::Char('r')));
+        let sel = app.current().unwrap().selection;
+        assert_eq!((sel.start, sel.end), (0, 2), "reset");
+
+        // Back to review.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Review);
+    }
+
+    #[test]
+    fn wrap_toggle_flips_and_resets_h_scroll() {
+        let (ctx, _dir) = ctx_for(finding(1, 1));
+        let mut app = PortApp::new(Session::new(vec![finding(1, 1)], "abc".into()), &ctx);
+        assert!(app.wrap, "wrap defaults on");
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.h_scroll, 1);
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(!app.wrap);
+        assert_eq!(app.h_scroll, 1, "turning wrap off keeps the pan");
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(app.wrap);
+        assert_eq!(app.h_scroll, 0, "turning wrap on resets the pan");
+    }
+
+    #[test]
+    fn scroll_keys_move_and_clamp() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let mut content = String::new();
+        // Long lines so the (fill-sized) window wraps beyond the pane; the
+        // comment sits mid-file so the window is not clamped by the edges.
+        for i in 1..=99 {
+            content.push_str(&format!("line {i} {}\n", "word ".repeat(40)));
+        }
+        content.push_str("// TODO: x\n");
+        for i in 101..=200 {
+            content.push_str(&format!("line {i} {}\n", "word ".repeat(40)));
+        }
+        std::fs::write(dir.path().join("src/a.rs"), content).unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: None,
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let mut app = PortApp::new(Session::new(vec![finding(100, 100)], "abc".into()), &ctx);
+
+        // Render once so the pane size is known.
+        let backend = TestBackend::new(60, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (_, _, total) = app.view(app.pane_height, app.pane_width);
+        assert!(total > app.pane_height, "wrapped window must overflow");
+        let max = total - app.pane_height;
+
+        // g goes to the top; the finding is below the fold, so j scrolls.
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.v_scroll, 0);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.v_scroll, 1);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.v_scroll, 0);
+
+        // G jumps to the bottom and clamps.
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.v_scroll, max);
+
+        // Ctrl-f pages down (clamped), Ctrl-b back to the top.
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(ctrl(KeyCode::Char('f')));
+        assert_eq!(app.v_scroll, app.pane_height);
+        app.handle_key(ctrl(KeyCode::Char('d')));
+        assert_eq!(app.v_scroll, app.pane_height + app.pane_height / 2);
+        app.handle_key(ctrl(KeyCode::Char('b')));
+        assert_eq!(app.v_scroll, app.pane_height / 2);
+        app.handle_key(ctrl(KeyCode::Char('b')));
+        assert_eq!(app.v_scroll, 0);
+
+        // z centers on the selected comment.
+        app.handle_key(ctrl(KeyCode::Char('f')));
+        app.handle_key(key(KeyCode::Char('z')));
+        assert!(app.v_scroll > 0);
+        assert!(app.v_scroll <= max);
     }
 
     #[test]
@@ -904,11 +1324,32 @@ mod tests {
             primary: 0,
             selection: Selection::full(1),
         };
-        let app = PortApp::new(Session::new(vec![finding], "abc".into()), &ctx);
+        let mut app = PortApp::new(Session::new(vec![finding], "abc".into()), &ctx);
         let snippet = app.current_snippet().unwrap();
         assert!(snippet.text.contains("fn before() {}"));
         assert!(snippet.text.contains("fn after() {}"));
         assert!(!snippet.text.contains("// TODO: x"));
+    }
+
+    #[test]
+    fn rendered_rows_estimates_wrapping() {
+        assert_eq!(rendered_rows("short line", 80, true), 1);
+        assert_eq!(rendered_rows("short line", 80, false), 1);
+        // Two words that do not fit on one line.
+        assert!(rendered_rows("aaaaaaaaaa bbbbbbbbbb", 10, true) > 1);
+        // A word longer than the pane spans multiple rows.
+        assert!(rendered_rows("aaaaaaaaaaaaaaaaaaaa", 8, true) >= 3);
+        // Empty text still occupies a row.
+        assert_eq!(rendered_rows("", 80, true), 1);
+    }
+
+    #[test]
+    fn fit_status_truncates_the_left_side() {
+        assert_eq!(fit_status("ab", "cd", 6), "ab  cd");
+        let fitted = fit_status("a very long left side", "right", 12);
+        assert_eq!(fitted.chars().count(), 12);
+        assert!(fitted.ends_with("right"));
+        assert!(fitted.contains('…'));
     }
 
     fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
