@@ -536,6 +536,80 @@ mod tests {
     }
 
     #[test]
+    fn execute_partial_failure_reports_per_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "// TODO: a\n").unwrap();
+        std::fs::write(root.join("b.rs"), "// TODO: b\n").unwrap();
+
+        let mut session = session_with(vec![
+            finding("a.rs", 1, "// TODO: a"),
+            finding("b.rs", 1, "// TODO: b"),
+        ]);
+        session.set_decision(0, Decision::Port(auto_draft(&session.findings[0], "abc")));
+        session.set_decision(1, Decision::Port(auto_draft(&session.findings[1], "abc")));
+        let snaps = snapshots(root, &session);
+
+        // The first issue is created, the second fails.
+        let runner = ScriptedRunner::new();
+        runner.push(true, r#"{"number": 1, "url": "https://x/1"}"#, "");
+        runner.push(false, "", "gh: repository not found");
+        let forge = todone_forge::forge::GitHubForge::new(
+            Box::new(runner.clone()),
+            Some("o/r".into()),
+            None,
+        );
+
+        let results = execute(&session, &forge, &snaps, root);
+        assert_eq!(results.len(), 2);
+
+        // First finding: created and removed.
+        assert_eq!(results[0].action, "port");
+        assert_eq!(results[0].issue.as_ref().unwrap().number, 1);
+        assert!(results[0].removed);
+        assert!(results[0].error.is_none());
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "");
+
+        // Second finding: the failure left the comment in place.
+        assert_eq!(results[1].action, "port");
+        assert!(results[1].issue.is_none());
+        assert!(!results[1].removed);
+        assert!(
+            results[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("repository not found")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.rs")).unwrap(),
+            "// TODO: b\n"
+        );
+    }
+
+    #[test]
+    fn execute_missing_snapshot_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "// TODO: fix\n").unwrap();
+
+        let mut session = session_with(vec![finding("a.rs", 1, "// TODO: fix")]);
+        session.set_decision(0, Decision::Delete);
+        // No snapshots at all: the removal has nothing to verify against.
+        let snaps = HashMap::new();
+
+        let runner = ScriptedRunner::new();
+        let forge = todone_forge::forge::GitHubForge::new(
+            Box::new(runner.clone()),
+            Some("o/r".into()),
+            None,
+        );
+        let results = execute(&session, &forge, &snaps, root);
+        assert!(!results[0].removed);
+        assert!(results[0].error.as_deref().unwrap().contains("no snapshot"));
+    }
+
+    #[test]
     fn mode_confirm_reached_after_all_decided() {
         let mut app = PortApp::new(
             session_with(vec![

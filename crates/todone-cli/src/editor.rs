@@ -302,4 +302,34 @@ mod tests {
         let outcome = edit_draft(&editor, &draft(), &snippet()).unwrap();
         assert_eq!(outcome, DraftOutcome::Aborted);
     }
+
+    #[test]
+    fn edit_draft_reports_editor_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fail.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 4\n").unwrap();
+        make_executable(&script);
+        let editor = Editor {
+            command: vec![script.to_string_lossy().into_owned()],
+        };
+        let err = edit_draft(&editor, &draft(), &snippet()).unwrap_err();
+        assert!(err.to_string().contains("exited with"), "{err}");
+    }
+
+    #[test]
+    fn edit_draft_reports_corrupted_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("corrupt.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'this is no template\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        make_executable(&script);
+        let editor = Editor {
+            command: vec![script.to_string_lossy().into_owned()],
+        };
+        let err = edit_draft(&editor, &draft(), &snippet()).unwrap_err();
+        assert!(err.to_string().contains("cannot decode"), "{err}");
+    }
 }

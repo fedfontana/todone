@@ -470,3 +470,69 @@ fn missing_scope_path_errors() {
         .failure()
         .stderr(predicate::str::contains("path does not exist"));
 }
+
+#[test]
+fn port_with_unknown_forge_fails() {
+    let dir = repo_fixture();
+    todone()
+        .current_dir(dir.path())
+        .args(["port", "--auto", "delete", "--forge", "gitlab"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown forge"));
+}
+
+#[test]
+fn scan_rejects_unknown_placeholder_in_config_pattern() {
+    let dir = repo_fixture();
+    fs::write(
+        dir.path().join("todone.toml"),
+        "[scan.match]\npattern = \"{comment}{marker}{nope}\"\n",
+    )
+    .unwrap();
+    todone()
+        .current_dir(dir.path())
+        .arg("scan")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown placeholder"));
+}
+
+#[test]
+fn scan_rejects_empty_category() {
+    let dir = repo_fixture();
+    todone()
+        .current_dir(dir.path())
+        .args(["scan", "--pattern", ""])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("categories must not be empty"));
+}
+
+#[test]
+fn port_rejects_invalid_auto_value() {
+    let dir = repo_fixture();
+    todone()
+        .current_dir(dir.path())
+        .args(["port", "--auto", "frobnicate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value"));
+}
+
+#[test]
+fn port_skips_non_utf8_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    fs::write(dir.path().join("bin.rs"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+    todone()
+        .current_dir(dir.path())
+        .args(["port", "--auto", "delete"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no marker comments found"));
+}
