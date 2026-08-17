@@ -163,7 +163,9 @@ impl Forge for GitHubForge {
         let repo = self.resolve_repo()?;
         // `gh issue create` has no `--json` flag; on success it prints the
         // issue URL as the last line of stdout (see [`parse_created`]). The
-        // exit status is checked before the output is parsed.
+        // exit status is checked before the output is parsed. The body is
+        // piped through stdin (`--body-file -`) so newlines, tabs, and
+        // indentation survive byte-for-byte.
         let args = [
             "issue",
             "create",
@@ -171,12 +173,12 @@ impl Forge for GitHubForge {
             &repo,
             "--title",
             &draft.title,
-            "--body",
-            &draft.description,
+            "--body-file",
+            "-",
         ];
         let output = self
             .runner
-            .run("gh", &args, None, None)
+            .run("gh", &args, Some(draft.description.as_str()), None)
             .map_err(|source| ForgeError::Io {
                 program: "gh".into(),
                 source,
@@ -286,9 +288,28 @@ mod tests {
                 "owner/repo",
                 "--title",
                 "Fix it",
-                "--body",
-                "It's broken.",
+                "--body-file",
+                "-",
             ]
+        );
+        assert_eq!(call.stdin.as_deref(), Some("It's broken."));
+    }
+
+    #[test]
+    fn create_issue_pipes_the_body_verbatim() {
+        // The body travels through stdin, so newlines, tabs, and code-fence
+        // indentation reach gh exactly as written.
+        let (forge, runner) = gh_runner();
+        runner.push(true, "https://github.com/owner/repo/issues/1\n", "");
+        let mut draft = draft();
+        draft.description =
+            "Ported from `src/lib.rs:3`\n\n```rust\n    let x = 1; // TODO\n```\n".into();
+
+        forge.create_issue(&draft).unwrap();
+        let call = &runner.calls()[0];
+        assert_eq!(
+            call.stdin.as_deref(),
+            Some("Ported from `src/lib.rs:3`\n\n```rust\n    let x = 1; // TODO\n```\n")
         );
     }
 
