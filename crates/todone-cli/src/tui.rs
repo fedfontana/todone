@@ -532,41 +532,88 @@ impl PortApp {
 
     /// The snippet for the current finding, as embedded in drafts.
     ///
-    /// Surrounding code only: comment bytes are scrubbed out of the context
-    /// window, so neither the selected comment nor neighbouring markers leak
-    /// into the issue, while the code of an inline comment (`let x = // TODO`)
-    /// survives the scrub.
+    /// Surrounding code only: comment bytes are scrubbed out of the context,
+    /// so neither the selected comment nor neighbouring markers leak into the
+    /// issue, while the code of an inline comment (`let x = 1; // TODO`)
+    /// survives the scrub. The window expands beyond the configured
+    /// before/after so it always spans that many *code* lines, no matter how
+    /// many comments had to be removed to reach them.
     pub fn current_snippet(&mut self) -> Option<ContextSnippet> {
         let cursor = self.session.cursor();
         let finding = self.session.findings.get(cursor).cloned()?;
-        let (before, after) = self.context_lines;
-        let source = self.source_of(&finding).to_string();
-        let context = extract_context(&source, &finding, before, after);
         let primary = &finding.run.comments[finding.primary];
-        let lines: Vec<String> = match self.comment_ranges_of(&finding) {
-            Some(ranges) => context
-                .lines
-                .iter()
-                .filter_map(|line| strip_ranges(&line.text, line.byte_range.start, &ranges))
-                .collect(),
+        let text = match self.scrubbed_snippet(&finding) {
+            Some(lines) if !lines.is_empty() => lines.join("\n"),
+            Some(_) => "(no surrounding context)".to_string(),
             // Without a loadable grammar fall back to dropping whole selected
-            // lines, as before.
-            None => context
-                .lines
-                .iter()
-                .filter(|line| line.kind != LineKind::Selected)
-                .map(|line| line.text.clone())
-                .collect(),
-        };
-        let text = if lines.is_empty() {
-            "(no surrounding context)".to_string()
-        } else {
-            lines.join("\n")
+            // lines from the plain window, as before.
+            None => {
+                let (before, after) = self.context_lines;
+                let source = self.source_of(&finding).to_string();
+                let context = extract_context(&source, &finding, before, after);
+                let lines: Vec<&str> = context
+                    .lines
+                    .iter()
+                    .filter(|line| line.kind != LineKind::Selected)
+                    .map(|line| line.text.as_str())
+                    .collect();
+                if lines.is_empty() {
+                    "(no surrounding context)".to_string()
+                } else {
+                    lines.join("\n")
+                }
+            }
         };
         Some(ContextSnippet {
             language: primary.language.clone(),
             text,
         })
+    }
+
+    /// The context lines of a finding's file with comment bytes scrubbed,
+    /// walking outwards from the primary comment until the configured
+    /// before/after counts of surviving code lines are collected (or the
+    /// file edges). `None` when the grammar cannot be loaded.
+    fn scrubbed_snippet(&mut self, finding: &Finding) -> Option<Vec<String>> {
+        let (before, after) = self.context_lines;
+        let source = self.source_of(finding).to_string();
+        let ranges = self.comment_ranges_of(finding)?;
+
+        let mut file_lines: Vec<(usize, &str)> = Vec::new();
+        let mut offset = 0usize;
+        for raw in source.lines() {
+            file_lines.push((offset, raw));
+            offset += raw.len() + 1;
+        }
+        let scrubbed: Vec<Option<String>> = file_lines
+            .iter()
+            .map(|(start, text)| strip_ranges(text, *start, &ranges))
+            .collect();
+
+        let primary_index = finding.line().saturating_sub(1);
+        let mut above: Vec<String> = Vec::new();
+        for text in scrubbed[..primary_index].iter().rev().flatten() {
+            above.push(text.clone());
+            if above.len() == before {
+                break;
+            }
+        }
+        above.reverse();
+
+        let mut below: Vec<String> = Vec::new();
+        for text in scrubbed[primary_index + 1..].iter().flatten() {
+            below.push(text.clone());
+            if below.len() == after {
+                break;
+            }
+        }
+
+        let mut out = above;
+        if let Some(text) = scrubbed.get(primary_index).and_then(Option::as_ref) {
+            out.push(text.clone());
+        }
+        out.extend(below);
+        Some(out)
     }
 
     /// The file byte ranges of every comment in the finding's file, or
@@ -2037,6 +2084,74 @@ mod tests {
         assert!(!snippet.text.contains("// TODO: something"));
         assert!(!snippet.text.contains("// FIXME: some other"));
         assert!(snippet.text.contains("fn after() {}"));
+    }
+
+    #[test]
+    fn snippet_expands_through_comments_to_the_configured_window() {
+        // The default window is 3 lines each way; the code sits beyond a wall
+        // of comments, so the snippet must walk past them until it collects
+        // the configured before/after code lines — and no further.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "fn real_above_two() {}\n\
+             fn real_above_one() {}\n\
+             // note one\n\
+             // note two\n\
+             // TODO: x\n\
+             // note three\n\
+             // note four\n\
+             fn real_below_one() {}\n\
+             fn real_below_two() {}\n\
+             fn real_below_three() {}\n\
+             fn real_below_four() {}\n",
+        )
+        .unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: Some("abc".into()),
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let run = CommentRun {
+            comments: vec![Comment {
+                path: "src/a.rs".into(),
+                line: 5,
+                end_line: 5,
+                column: 0,
+                byte_range: 64..74,
+                text: "// TODO: x".into(),
+                language: "rust".into(),
+            }],
+        };
+        let finding = Finding {
+            run,
+            category: "TODO".into(),
+            primary: 0,
+            selection: Selection::full(1),
+        };
+        let mut app = PortApp::new(Session::new(vec![finding], "abc".into()), &ctx);
+        let snippet = app.current_snippet().unwrap();
+        let lines: Vec<&str> = snippet.text.lines().collect();
+        // Both code lines above the comment wall.
+        assert_eq!(lines[0], "fn real_above_two() {}");
+        assert_eq!(lines[1], "fn real_above_one() {}");
+        // Three below (the configured after), stopping before the sentinel.
+        assert_eq!(
+            lines[2..],
+            [
+                "fn real_below_one() {}",
+                "fn real_below_two() {}",
+                "fn real_below_three() {}",
+            ]
+        );
+        assert!(!snippet.text.contains("real_below_four"));
+        assert!(!snippet.text.contains("note"));
     }
 
     #[test]
