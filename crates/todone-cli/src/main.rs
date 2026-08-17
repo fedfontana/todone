@@ -16,9 +16,6 @@ use clap::Parser;
 
 use crate::cli::{Cli, Command};
 
-// TODO: should really change the template for the issue file: first h1 is the title of the issue, everything else is the content. Might even make the title part of the frontmatter, and have the description be everything after it. Might also change the frontmatter to include a comment explaining what to do? Might also Move the content that is auto included to a comment that is not included in the final issue? Maybe configurable
-// TODO: currently if the edit breaks the format the whole app quits, let's just void the change, go back to the tui in the same spot and notify the user
-// TODO: move some info from the top bar to the bottom bar
 // TODO: add some color and nicer in the final page
 // TODO: streaming parsing (we lose the total number at start, but can start faster. Maybe move
 // parsing to other thread so it can go on while the user looks at the first part?)
