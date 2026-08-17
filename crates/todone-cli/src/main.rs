@@ -16,16 +16,7 @@ use clap::Parser;
 
 use crate::cli::{Cli, Command};
 
-// TODO: add some color and nicer in the final page
-// TODO: streaming parsing (we lose the total number at start, but can start faster. Maybe move
-// parsing to other thread so it can go on while the user looks at the first part?)
-// TODO: change `o view` in bottom bar to `o open` and don't promise it to be readonly, since we
-// already have the movable preview
-// TODO: mouse && scroll support. Currently after using the mouse everything feels off and sluggish
-// TODO: react to file changes. Must notify the user if a previously selected TODO is removed/moved via external file change
-// TODO: give option to consider the content right after `// TODO:` as the title, and the lines contigous to it (but still in the same comment) as the initial content of the issue
 // TODO: move to `turdo` package
-// TODO: better help (floating) menu
 // TODO: progress floaging page with navigation
 // FIXME: this should not be recognized as todo
 // ```sh
