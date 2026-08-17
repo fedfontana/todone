@@ -7,9 +7,10 @@
 //! A comment node may span several lines. It is split into "visual" comments
 //! at blank lines (blank-only markers like a bare `//` are a boundary and are
 //! dropped), and every comment that matches a category becomes its own
-//! finding — attached neighbours travel with the finding whose match they
-//! surround, so a `// TODO` followed by an explanatory line is removed as a
-//! pair while two adjacent `// TODO`s stay independent.
+//! finding — comments that follow a match (explanatory continuations) travel
+//! with it, so a `// TODO` followed by an explanatory line is removed as a
+//! pair, while two adjacent `// TODO`s stay independent and a plain comment
+//! *above* a marker is left alone.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -409,8 +410,9 @@ fn group_runs(comments: &[Comment]) -> Vec<CommentRun> {
 /// Partitions an adjacent comment run into findings: every comment that
 /// matches a category starts a new segment, so each segment holds exactly
 /// one matched comment plus any attached neighbours. Non-matching comments
-/// between two matches travel with the segment of the *preceding* match;
-/// leading and trailing neighbours attach to the first and last segment.
+/// travel with the *preceding* match; comments that come before the first
+/// match belong to no finding (a plain note above a `FIXME` is not selected
+/// with it).
 ///
 /// The returned tuples are `(category, index of the matched comment within
 /// the segment, the segment's comments)`.
@@ -425,7 +427,16 @@ fn matched_segments(run: &CommentRun, matcher: &Matcher) -> Vec<(String, usize, 
     for comment in &run.comments {
         match matcher.match_category(&comment.text) {
             Some(category) => {
-                if segments.is_empty() || segments.last().unwrap().category.is_some() {
+                if segments
+                    .last()
+                    .is_some_and(|segment| segment.category.is_some())
+                {
+                    segments.push(Segment {
+                        comments: Vec::new(),
+                        category: None,
+                    });
+                }
+                if segments.is_empty() {
                     segments.push(Segment {
                         comments: Vec::new(),
                         category: None,
@@ -433,20 +444,18 @@ fn matched_segments(run: &CommentRun, matcher: &Matcher) -> Vec<(String, usize, 
                 }
                 let segment = segments.last_mut().unwrap();
                 segment.comments.push(comment.clone());
-                // The first match of a segment is its primary; later matches
-                // already created their own segment.
                 if segment.category.is_none() {
                     segment.category = Some((category.to_string(), segment.comments.len() - 1));
                 }
             }
             None => {
-                if segments.is_empty() {
-                    segments.push(Segment {
-                        comments: Vec::new(),
-                        category: None,
-                    });
+                // Only a continuation of an already-matched segment; comments
+                // before the first match never join a finding.
+                if let Some(segment) = segments.last_mut()
+                    && segment.category.is_some()
+                {
+                    segment.comments.push(comment.clone());
                 }
-                segments.last_mut().unwrap().comments.push(comment.clone());
             }
         }
     }
@@ -635,6 +644,30 @@ mod tests {
         assert_eq!(second.category, "TODO");
         assert_eq!(second.line(), 3);
         assert_eq!(second.run.comments.len(), 1);
+    }
+
+    #[test]
+    fn leading_comment_is_not_part_of_the_run() {
+        // A plain comment above a marker is not selected with it (keepup
+        // providers.ts:272-273).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "providers.ts",
+            "// Source configs are flat records: string | number | boolean values only — no arrays or nested objects.\n// FIXME: refine for each provider?\nexport type ProviderConfigRecord = Record<string, string | number | boolean>;\n",
+        );
+        let result = scan_dir(root, vec![]);
+        assert_eq!(result.findings.len(), 1);
+        let finding = &result.findings[0];
+        assert_eq!(finding.category, "FIXME");
+        assert_eq!(finding.line(), 2);
+        assert_eq!(finding.run.comments.len(), 1);
+        assert_eq!(
+            finding.run.comments[0].text,
+            "// FIXME: refine for each provider?"
+        );
+        assert!(finding.selection.is_full(1));
     }
 
     #[test]
