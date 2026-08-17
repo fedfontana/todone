@@ -204,7 +204,8 @@ pub fn is_placeholder_title(title: &str) -> bool {
 /// The leading marker characters (`//`, `/*`, `#`, `*`, ...) and the first
 /// occurrence of `category` are removed, along with the delimiter that
 /// follows the marker (`:`, `!`, `(`, or whitespace). Only the first line is
-/// considered; the result is trimmed and truncated to 72 columns.
+/// considered, and the result is trimmed but otherwise kept verbatim — the
+/// draft's `# Title:` line is never truncated.
 ///
 /// Falls back to [`TITLE_PLACEHOLDER`] when the marker is not the first
 /// content token (the comment is not, in fact, a marker comment) or nothing
@@ -233,7 +234,7 @@ pub fn issue_title(comment: &str, category: &str) -> String {
         return TITLE_PLACEHOLDER.to_string();
     }
     let rest = body.get(category.len()..).unwrap_or("");
-    let mut title: String = rest
+    let title: String = rest
         .trim_start_matches([':', '!', '(', ' ', '\t'])
         .trim()
         // A single-line block comment leaves its closing `*/` behind.
@@ -241,12 +242,10 @@ pub fn issue_title(comment: &str, category: &str) -> String {
         .trim()
         .to_string();
     if title.is_empty() {
-        return TITLE_PLACEHOLDER.to_string();
+        TITLE_PLACEHOLDER.to_string()
+    } else {
+        title
     }
-    if title.chars().count() > 72 {
-        title = format!("{}…", title.chars().take(72).collect::<String>());
-    }
-    title
 }
 
 #[cfg(test)]
@@ -381,11 +380,13 @@ mod tests {
     }
 
     #[test]
-    fn issue_title_truncates_long_titles() {
-        let comment = format!("// TODO: {}", "word ".repeat(20));
-        let title = issue_title(&comment, "TODO");
-        assert_eq!(title.chars().count(), 72 + 1);
-        assert!(title.ends_with('…'));
+    fn issue_title_keeps_long_titles_verbatim() {
+        // The draft title is never truncated: the user edits it in place.
+        let comment = format!("// TODO: {}", "word ".repeat(40));
+        let expected = comment.strip_prefix("// TODO: ").unwrap().trim_end();
+        assert_eq!(issue_title(&comment, "TODO"), expected);
+        assert!(issue_title(&comment, "TODO").chars().count() > 72);
+        assert!(!issue_title(&comment, "TODO").contains('…'));
     }
 
     #[test]
