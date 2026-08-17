@@ -58,10 +58,12 @@
 
 ---
 leftover issues:
-- C-p does not work, p for port is triggered
-- when text is reflowed for wrap, right now it overrides the next line rail, but it should not do that probably
 - more color on status line
 - if nerd font (setting), then use some cooler chars
+- precommit checks signal no clippy/linter files to run on, seems strange
+
+- C-p does not work, p for port is triggered. Change p to some other, C-p stays
+- when text is reflowed for wrap, right now it overrides the next line rail, but it should not do that probably. The rail should be there (without line number) and the text after it
 - in some cases we still add the previous lines to the comments
     ```
     // Some real comment
@@ -80,5 +82,5 @@ leftover issues:
     - Example: keepup 6/225, commons/src/schemas/settings.ts:4
         - CommandPalette.tsx:54 with many comments one after the other works, even when two comments with the same type follow each other, so that is not the issue
 - when we remove the TODO|FIXME comments from the context, we should expand the context until it spans the configured After/Before
-- text content of the comment should not be truncated or have ellipsis added when in the title
-- wrong pattern currently probably, the pattern for whitespace is `\s`, currently using `\w`
+- text content of the comment should not be truncated or have ellipsis added when in the title in the edit page
+- wrong pattern currently probably (this is on me), the pattern for whitespace is `\s`, currently using `\w`. This might fix one of the above issues

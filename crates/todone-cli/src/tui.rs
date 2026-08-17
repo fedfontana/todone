@@ -375,40 +375,40 @@ impl PortApp {
     }
 
     fn handle_review_key(&mut self, key: &ratatui::crossterm::event::KeyEvent) -> AppAction {
-        use ratatui::crossterm::event::KeyCode::{Char, Esc};
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         if let Some(action) = self.handle_nav_key(key) {
             return action;
         }
-        match key.code {
-            Char('p') => AppAction::Continue, // handled by the caller (editor session)
-            Char('o') => AppAction::Continue, // handled by the caller (read-only view)
-            Char('s') => {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('t'), KeyModifiers::NONE) => AppAction::Continue, // editor session
+            (KeyCode::Char('o'), KeyModifiers::NONE) => AppAction::Continue, // read-only view
+            (KeyCode::Char('s'), _) => {
                 self.decide(Decision::Skip);
                 self.advance()
             }
-            Char('d') => {
+            (KeyCode::Char('d'), _) => {
                 self.decide(Decision::Delete);
                 self.advance()
             }
-            Char('x') => {
+            (KeyCode::Char('x'), _) => {
                 self.session.set_current_decision(Decision::Skip);
                 self.message = Some("decision cleared".into());
                 self.undecide();
                 AppAction::Continue
             }
-            Char('e') => {
+            (KeyCode::Char('e'), _) => {
                 self.mode = Mode::SelectionEdit;
                 AppAction::Continue
             }
-            Char('c') => {
+            (KeyCode::Char('c'), _) => {
                 self.mode = Mode::Confirm;
                 AppAction::Continue
             }
-            Char('?') => {
+            (KeyCode::Char('?'), _) => {
                 self.show_help = true;
                 AppAction::Continue
             }
-            Char('q') | Esc => {
+            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
                 if self.auto_confirm {
                     AppAction::Execute
                 } else {
@@ -667,7 +667,7 @@ pub fn render(frame: &mut ratatui::Frame, app: &mut PortApp) {
 
 fn render_help(frame: &mut ratatui::Frame) {
     let help = vec![
-        Line::from("p  port the comment to an issue (opens the editor)"),
+        Line::from("t  port the comment to an issue (opens the editor)"),
         Line::from("o  open the file read-only in the editor"),
         Line::from("s  skip the comment"),
         Line::from("d  delete the comment without creating an issue"),
@@ -931,7 +931,7 @@ fn fit_status(left: &str, right: &str, width: usize) -> String {
 fn render_hints(frame: &mut ratatui::Frame, area: Rect, app: &PortApp) {
     let mode_hint = match app.mode {
         Mode::Review => {
-            "p port · s skip · d delete · o view · e select · Ctrl-n/p nav · c confirm · ? help · q quit"
+            "t port · s skip · d delete · o view · e select · Ctrl-n/p nav · c confirm · ? help · q quit"
         }
         Mode::SelectionEdit => "[ ] grow · { } shrink · r reset · esc done",
         Mode::Confirm => "y execute · b back · q quit",
@@ -1024,6 +1024,30 @@ fn render_confirm(frame: &mut ratatui::Frame, app: &mut PortApp) {
     );
 }
 
+/// The editor-bound actions that take over the terminal on the review
+/// screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorAction {
+    /// `t`: open the issue draft in `$EDITOR`.
+    Port,
+    /// `o`: open the file read-only in `$EDITOR`.
+    View,
+}
+
+/// Maps a raw key to an editor-bound action, or `None` when the key belongs
+/// to navigation or decision-making.
+///
+/// The bare keys only: control-modified chords never fire these, so `Ctrl-p`
+/// stays finding navigation and `Ctrl-o`/`Ctrl-t` cannot be swallowed either.
+fn editor_action(key: &ratatui::crossterm::event::KeyEvent) -> Option<EditorAction> {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('t'), KeyModifiers::NONE) => Some(EditorAction::Port),
+        (KeyCode::Char('o'), KeyModifiers::NONE) => Some(EditorAction::View),
+        _ => None,
+    }
+}
+
 /// Runs the interactive review loop on the real terminal.
 ///
 /// The TUI leaves the alternate screen while an editor session runs, and
@@ -1039,7 +1063,7 @@ pub fn run_interactive(
     editor: &crate::editor::Editor,
 ) -> anyhow::Result<AppAction> {
     use ratatui::backend::CrosstermBackend;
-    use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use ratatui::crossterm::event::{self, Event, KeyEventKind};
     use ratatui::crossterm::execute;
     use ratatui::crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -1061,10 +1085,11 @@ pub fn run_interactive(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        // The editor-bound keys only apply on the review screen.
+        // The editor-bound keys only apply on the review screen, and only
+        // for the bare key: control-modified chords belong to navigation.
         if app.mode == Mode::Review {
-            match key.code {
-                KeyCode::Char('p') => {
+            match editor_action(&key) {
+                Some(EditorAction::Port) => {
                     let draft = app.prefilled_draft();
                     let snippet = app.current_snippet();
                     let Some(draft) = draft else {
@@ -1086,7 +1111,7 @@ pub fn run_interactive(
                     }
                     continue;
                 }
-                KeyCode::Char('o') => {
+                Some(EditorAction::View) => {
                     let Some(finding) = app.session.current() else {
                         continue;
                     };
@@ -1100,7 +1125,7 @@ pub fn run_interactive(
                     }
                     continue;
                 }
-                _ => {}
+                None => {}
             }
         }
         let action = app.handle_key(key);
@@ -1274,6 +1299,25 @@ mod tests {
         );
         assert_eq!(app.session.cursor(), 1);
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), AppAction::Quit);
+    }
+
+    #[test]
+    fn editor_action_ignores_control_chords() {
+        // Ctrl-p is finding navigation, never mistaken for the port action
+        // that used to hijack it through the bare `p` binding.
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(
+            editor_action(&press(KeyCode::Char('t'))),
+            Some(EditorAction::Port)
+        );
+        assert_eq!(
+            editor_action(&press(KeyCode::Char('o'))),
+            Some(EditorAction::View)
+        );
+        assert_eq!(editor_action(&ctrl(KeyCode::Char('p'))), None);
+        assert_eq!(editor_action(&ctrl(KeyCode::Char('t'))), None);
+        assert_eq!(editor_action(&ctrl(KeyCode::Char('o'))), None);
+        assert_eq!(editor_action(&press(KeyCode::Char('s'))), None);
     }
 
     #[test]

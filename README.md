@@ -61,7 +61,7 @@ forge, commit, `i/n`, undecided count, mode, wrap, scroll position):
 
 | key | action |
 |---|---|
-| `p` | **port** — opens the prefilled issue draft in `$EDITOR`; saving records the decision, quitting without changes returns to this finding |
+| `t` | **port** — opens the prefilled issue draft in `$EDITOR`; saving records the decision, quitting without changes returns to this finding |
 | `s` / `d` | skip / delete (delete removes the comment without creating an issue) |
 | `x` | clear the decision for this finding |
 | `o` | open the file read-only in `$EDITOR` at the comment line (vim-family editors get `-R +line`) |
