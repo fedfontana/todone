@@ -7,7 +7,6 @@
 
 use std::path::PathBuf;
 
-use serde::Deserialize;
 use thiserror::Error;
 use todone_core::config::ForgeConfig;
 use todone_core::draft::IssueDraft;
@@ -162,6 +161,9 @@ impl Forge for GitHubForge {
 
     fn create_issue(&self, draft: &IssueDraft) -> Result<IssueCreated, ForgeError> {
         let repo = self.resolve_repo()?;
+        // `gh issue create` has no `--json` flag; on success it prints the
+        // issue URL as the last line of stdout (see [`parse_created`]). The
+        // exit status is checked before the output is parsed.
         let args = [
             "issue",
             "create",
@@ -171,8 +173,6 @@ impl Forge for GitHubForge {
             &draft.title,
             "--body",
             &draft.description,
-            "--json",
-            "number,url",
         ];
         let output = self
             .runner
@@ -186,18 +186,29 @@ impl Forge for GitHubForge {
     }
 }
 
-/// Parses `gh issue create --json number,url` output.
+/// Parses `gh issue create` output into an [`IssueCreated`].
+///
+/// `gh issue create` does not support `--json`: in non-interactive mode it
+/// prints the issue URL (e.g. `https://github.com/owner/repo/issues/42`) as
+/// the last line of stdout, possibly preceded by other text. The issue
+/// number is the URL's last path segment. A non-zero exit status is rejected
+/// by [`checked`] before this function runs.
 fn parse_created(stdout: &str) -> Result<IssueCreated, ForgeError> {
-    #[derive(Deserialize)]
-    struct Created {
-        number: u64,
-        url: String,
-    }
-    let created: Created =
-        serde_json::from_str(stdout).map_err(|e| ForgeError::Parse(e.to_string()))?;
+    let url = stdout
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| ForgeError::Parse("empty output".into()))?;
+    let number = url
+        .rsplit('/')
+        .next()
+        .and_then(|segment| segment.split(['#', '?']).next())
+        .and_then(|segment| segment.parse::<u64>().ok())
+        .ok_or_else(|| ForgeError::Parse(format!("cannot read the issue number from {url:?}")))?;
     Ok(IssueCreated {
-        number: created.number,
-        url: created.url,
+        number,
+        url: url.to_string(),
     })
 }
 
@@ -258,11 +269,7 @@ mod tests {
     #[test]
     fn create_issue_builds_the_right_command() {
         let (forge, runner) = gh_runner();
-        runner.push(
-            true,
-            r#"{"number": 42, "url": "https://github.com/owner/repo/issues/42"}"#,
-            "",
-        );
+        runner.push(true, "https://github.com/owner/repo/issues/42\n", "");
 
         let created = forge.create_issue(&draft()).unwrap();
         assert_eq!(created.number, 42);
@@ -281,10 +288,22 @@ mod tests {
                 "Fix it",
                 "--body",
                 "It's broken.",
-                "--json",
-                "number,url",
             ]
         );
+    }
+
+    #[test]
+    fn create_issue_takes_the_url_from_the_last_output_line() {
+        let (forge, runner) = gh_runner();
+        runner.push(
+            true,
+            "some banner line\nhttps://github.com/owner/repo/issues/7\n",
+            "",
+        );
+
+        let created = forge.create_issue(&draft()).unwrap();
+        assert_eq!(created.number, 7);
+        assert_eq!(created.url, "https://github.com/owner/repo/issues/7");
     }
 
     #[test]
@@ -300,8 +319,13 @@ mod tests {
     #[test]
     fn create_issue_parses_bad_output() {
         let (forge, runner) = gh_runner();
-        runner.push(true, "not json", "");
+        runner.push(true, "not a url", "");
+        let err = forge.create_issue(&draft()).unwrap_err();
+        assert!(matches!(err, ForgeError::Parse(_)));
 
+        // Empty output is not a valid creation result either.
+        let (forge, runner) = gh_runner();
+        runner.push(true, "", "");
         let err = forge.create_issue(&draft()).unwrap_err();
         assert!(matches!(err, ForgeError::Parse(_)));
     }
@@ -354,11 +378,7 @@ mod tests {
         let root = std::path::PathBuf::from("/tmp/target-repo");
         let runner = crate::process::ScriptedRunner::new();
         runner.push(true, r#"{"nameWithOwner": "owner/repo-b"}"#, "");
-        runner.push(
-            true,
-            r#"{"number": 7, "url": "https://github.com/owner/repo-b/issues/7"}"#,
-            "",
-        );
+        runner.push(true, "https://github.com/owner/repo-b/issues/7\n", "");
         let forge = GitHubForge::new(Box::new(runner.clone()), None, Some(root.clone()));
 
         let created = forge.create_issue(&draft()).unwrap();

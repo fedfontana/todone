@@ -394,11 +394,7 @@ mod tests {
         let snaps = snapshots(root, &session);
 
         let runner = ScriptedRunner::new();
-        runner.push(
-            true,
-            r#"{"number": 7, "url": "https://github.com/o/r/issues/7"}"#,
-            "",
-        );
+        runner.push(true, "https://github.com/o/r/issues/7\n", "");
         let forge = todone_forge::forge::GitHubForge::new(
             Box::new(runner.clone()),
             Some("o/r".into()),
@@ -470,7 +466,7 @@ mod tests {
         let snaps = snapshots(root, &session);
 
         let runner = ScriptedRunner::new();
-        runner.push(true, r#"{"number": 9, "url": "https://x/9"}"#, "");
+        runner.push(true, "https://x/9\n", "");
         let forge = todone_forge::forge::GitHubForge::new(
             Box::new(runner.clone()),
             Some("o/r".into()),
@@ -614,7 +610,7 @@ mod tests {
 
         // The first issue is created, the second fails.
         let runner = ScriptedRunner::new();
-        runner.push(true, r#"{"number": 1, "url": "https://x/1"}"#, "");
+        runner.push(true, "https://x/1\n", "");
         runner.push(false, "", "gh: repository not found");
         let forge = todone_forge::forge::GitHubForge::new(
             Box::new(runner.clone()),
