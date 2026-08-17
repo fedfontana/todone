@@ -17,33 +17,6 @@ use clap::Parser;
 use crate::cli::{Cli, Command};
 
 // TODO: move to `turdo` package
-// TODO: progress floaging page with navigation
-// FIXME: this should not be recognized as todo
-// ```sh
-// │ > 251 │ /// "// TODO: fix\n",                                                                                                                                                                                                                               │
-// │ > 252 │ /// ).unwrap();                                                                                                                                                                                                                                     │
-// │ > 253 │ /// assert_eq!(comments.len(), 1);                                                                                                                                                                                                                  │
-// │ > 254 │ /// assert_eq!(comments[0].line, 1);                                                                                                                                                                                                                │
-// │ > 255 │ /// ```
-// ```
-// // FIXME: also seems like we lose indentation in comments
-// ```
-// │   242 │ /// ```                                                                                                                                                                                                                                             │
-// │   243 │ /// use std::path::Path;                                                                                                                                                                                                                            │
-// │   244 │ /// use todone_core::language;                                                                                                                                                                                                                      │
-// │   245 │ /// use todone_core::scan::parse_comment_nodes;                                                                                                                                                                                                     │
-// │   246 │ ///                                                                                                                                                                                                                                                 │
-// │   247 │ /// let lang = language::by_extension(Path::new("a.rs")).unwrap();                                                                                                                                                                                  │
-// │   248 │ /// let comments = parse_comment_nodes(                                                                                                                                                                                                             │
-// │   249 │ /// Path::new("a.rs").into(),                                                                                                                                                                                                                       │
-// │   250 │ /// lang,                                                                                                                                                                                                                                           │
-// │ > 251 │ /// "// TODO: fix\n",                                                                                                                                                                                                                               │
-// │ > 252 │ /// ).unwrap();                                                                                                                                                                                                                                     │
-// │ > 253 │ /// assert_eq!(comments.len(), 1);                                                                                                                                                                                                                  │
-// │ > 254 │ /// assert_eq!(comments[0].line, 1);                                                                                                                                                                                                                │
-// │ > 255 │ /// ```
-// ```
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let color = resolve_color(cli.color, cli.no_color, std::io::stdout().is_terminal());
