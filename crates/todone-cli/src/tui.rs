@@ -15,11 +15,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use todone_core::draft::{ContextSnippet, IssueDraft};
 use todone_core::model::Finding;
 use todone_core::session::{Decision, Session};
-use unicode_width::UnicodeWidthStr;
 
 use crate::context::{Context, LineKind, extract_context};
 use crate::editor::edit_draft;
@@ -203,13 +202,21 @@ impl PortApp {
     }
 
     /// The context pane plus the rendered row count of each line and the
-    /// total height.
+    /// total height. Rows are counted on the text width left over after the
+    /// gutter, so the scroll math matches what the pane renders.
     fn view(&mut self, _pane_height: usize, pane_width: usize) -> (Context, Vec<usize>, usize) {
         let context = self.context_for_finding(self.session.cursor());
+        let digits = context
+            .lines
+            .iter()
+            .map(|line| line.line.to_string().len())
+            .max()
+            .unwrap_or(1);
+        let text_width = pane_width.saturating_sub(gutter_width(digits));
         let rows: Vec<usize> = context
             .lines
             .iter()
-            .map(|line| rendered_rows(&line.text, pane_width, self.wrap, self.tab_width))
+            .map(|line| rendered_rows(&line.text, text_width, self.wrap, self.tab_width))
             .collect();
         let total = rows.iter().sum();
         (context, rows, total)
@@ -609,21 +616,140 @@ fn strip_ranges(
     }
 }
 
-/// Expands tabs to spaces with `tab_width` tab stops.
-fn expand_tabs(text: &str, tab_width: usize) -> String {
-    let mut out = String::with_capacity(text.len() + 16);
+/// Expands tabs to spaces with `tab_width` tab stops, keeping the original
+/// byte offset of every rendered column so highlight and selection styling
+/// can be applied after reflow.
+fn expanded_columns(text: &str, tab_width: usize) -> Vec<(char, usize)> {
+    let mut cols = Vec::with_capacity(text.len());
     let mut col = 0usize;
-    for ch in text.chars() {
+    for (i, ch) in text.char_indices() {
         if ch == '\t' {
             let spaces = tab_width - col % tab_width;
-            out.extend(std::iter::repeat_n(' ', spaces));
+            cols.extend(std::iter::repeat_n((' ', i), spaces));
             col += spaces;
         } else {
+            cols.push((ch, i));
             col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            out.push(ch);
         }
     }
-    out
+    cols
+}
+
+/// The gutter width in columns: marker, line number, rail, and padding.
+fn gutter_width(digits: usize) -> usize {
+    digits + 6
+}
+
+/// Splits a line into display rows of at most `width` columns after tab
+/// expansion, carrying each column's original byte offset.
+///
+/// Words never break mid-word (a word wider than the row spans several rows
+/// on its own). The space run at the start of a line is preserved — code
+/// indentation — while spaces between words collapse to one, and reflowed
+/// rows drop the spaces that would precede a wrapped word.
+fn wrap_columns(text: &str, width: usize, tab_width: usize) -> Vec<Vec<(char, usize)>> {
+    let cols = expanded_columns(text, tab_width);
+    if width == 0 {
+        return vec![cols];
+    }
+
+    let column_width = |ch: char| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+
+    // The line as words plus their leading space runs.
+    struct Chunk {
+        leading: Vec<(char, usize)>,
+        word: Vec<(char, usize)>,
+    }
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut pending: Vec<(char, usize)> = Vec::new();
+    let mut word: Vec<(char, usize)> = Vec::new();
+    for column in cols {
+        if column.0 == ' ' {
+            if !word.is_empty() {
+                chunks.push(Chunk {
+                    leading: std::mem::take(&mut pending),
+                    word: std::mem::take(&mut word),
+                });
+            }
+            pending.push(column);
+        } else {
+            word.push(column);
+        }
+    }
+    if !word.is_empty() || chunks.is_empty() {
+        chunks.push(Chunk {
+            leading: pending,
+            word,
+        });
+    }
+
+    let mut rows: Vec<Vec<(char, usize)>> = Vec::new();
+    let mut current: Vec<(char, usize)> = Vec::new();
+    let mut col = 0usize;
+    for chunk in chunks {
+        let word_width: usize = chunk.word.iter().map(|(ch, _)| column_width(*ch)).sum();
+        if !chunk.word.is_empty() && word_width >= width {
+            // A word wider than the pane spans multiple rows by itself; it
+            // starts on a fresh row and its remainder stays on the last.
+            if !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+            }
+            let mut rest = chunk.word.as_slice();
+            loop {
+                let mut used = 0usize;
+                let mut end = 0;
+                for (ch, _) in rest {
+                    let width_of = column_width(*ch);
+                    if used + width_of > width && end > 0 {
+                        break;
+                    }
+                    used += width_of;
+                    end += 1;
+                }
+                if end == 0 {
+                    end = 1;
+                    used = column_width(rest[0].0);
+                }
+                if used < width {
+                    // The tail does not fill a row: it stays current.
+                    current.extend_from_slice(&rest[..end]);
+                    break;
+                }
+                rows.push(rest[..end].to_vec());
+                rest = &rest[end..];
+                if rest.is_empty() {
+                    break;
+                }
+            }
+            col = word_width % width;
+            continue;
+        }
+        if col > 0 && col + 1 + word_width > width {
+            // The word does not fit after one space: wrap, and the pending
+            // spaces do not carry over to the reflowed row.
+            rows.push(std::mem::take(&mut current));
+            current.extend(chunk.word);
+            col = word_width;
+            continue;
+        }
+        let leading_len = chunk.leading.len();
+        if col == 0 {
+            // First row: the full indentation survives.
+            current.extend(chunk.leading);
+            col += leading_len;
+        } else if leading_len > 0 {
+            // Inter-word gaps collapse to a single space.
+            let offset = chunk.leading[0].1;
+            current.push((' ', offset));
+            col += 1;
+        }
+        current.extend(chunk.word);
+        col += word_width;
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
 }
 
 /// The number of display rows a context line occupies at `width`, after tab
@@ -632,25 +758,7 @@ fn rendered_rows(text: &str, width: usize, wrap: bool, tab_width: usize) -> usiz
     if !wrap || width == 0 {
         return 1;
     }
-    let text = expand_tabs(text, tab_width);
-    let mut rows = 1usize;
-    let mut col = 0usize;
-    for word in text.split_whitespace() {
-        let word_width = UnicodeWidthStr::width(word);
-        if word_width >= width {
-            // A word wider than the pane spans multiple rows by itself.
-            rows += word_width / width;
-            col = word_width % width;
-            continue;
-        }
-        if col > 0 && col + 1 + word_width > width {
-            rows += 1;
-            col = word_width;
-        } else {
-            col += if col == 0 { word_width } else { 1 + word_width };
-        }
-    }
-    rows
+    wrap_columns(text, width, tab_width).len()
 }
 
 /// Renders the whole app into a frame.
@@ -749,6 +857,11 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, app: &PortApp) {
 /// lines: only lines intersecting the viewport are built, so the per-frame
 /// cost stays proportional to the pane rather than the file.
 ///
+/// Wrapped lines are reflowed here, one ratatui line per display row: the
+/// first row carries the gutter with its line number, continuation rows keep
+/// the rail (`│`) without the number. The paragraph is not asked to wrap
+/// again.
+///
 /// Returns the lines plus the absolute row of the first built line; the
 /// caller scrolls the paragraph by `v_scroll - first_row`, so the offset is
 /// applied exactly once.
@@ -758,6 +871,7 @@ fn context_to_lines(
     rows: &[usize],
     v_scroll: usize,
     pane_height: usize,
+    pane_width: usize,
 ) -> (Vec<Line<'static>>, usize) {
     let empty = (Vec::new(), 0);
     let Some(finding) = app.session.findings.get(app.session.cursor()).cloned() else {
@@ -774,6 +888,7 @@ fn context_to_lines(
         .map(|line| line.line.to_string().len())
         .max()
         .unwrap_or(1);
+    let text_width = pane_width.saturating_sub(gutter_width(width));
 
     // Cumulative row starts, so the visible line range can be found.
     let mut starts = Vec::with_capacity(rows.len() + 1);
@@ -800,45 +915,42 @@ fn context_to_lines(
             } else {
                 " "
             };
-        let gutter = format!(" {marker} {:>width$} │ ", line.line, width = width);
-        let mut spans_line = Vec::new();
-        spans_line.push(Span::styled(
-            gutter,
-            Style::default().fg(Color::Rgb(90, 100, 110)),
-        ));
-
-        let mut col = 0usize;
-        for (i, ch) in line.text.char_indices() {
-            let offset = line.byte_range.start + i;
-            let span = spans
-                .iter()
-                .rev()
-                .find(|s| offset >= s.range.start && offset < s.range.end);
-            let mut style = match span.and_then(|s| s.fg) {
-                Some((r, g, b)) => {
-                    let mut style = Style::default().fg(Color::Rgb(r, g, b));
-                    if span.is_some_and(|s| s.italic) {
-                        style = style.add_modifier(Modifier::ITALIC);
-                    }
-                    style
-                }
-                None => Style::default(),
-            };
-            if offset >= selection.start && offset < selection.end {
-                style = style.bg(Color::Rgb(38, 46, 58));
-            }
-            // Tabs are control characters: ratatui drops them, so they are
-            // expanded to spaces here (style included).
-            if ch == '\t' {
-                let spaces = app.tab_width - col % app.tab_width;
-                col += spaces;
-                spans_line.push(Span::styled(" ".repeat(spaces), style));
+        let number = line.line.to_string();
+        let gutter_style = Style::default().fg(Color::Rgb(90, 100, 110));
+        for (row_index, row) in wrap_columns(&line.text, text_width, app.tab_width)
+            .iter()
+            .enumerate()
+        {
+            let gutter = if row_index == 0 {
+                format!(" {marker} {number:>width$} │ ")
             } else {
-                col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                // A reflowed row keeps the rail, without the line number.
+                format!("   {:>width$} │ ", "")
+            };
+            let mut spans_line = Vec::new();
+            spans_line.push(Span::styled(gutter, gutter_style));
+            for (ch, offset) in row {
+                let span = spans
+                    .iter()
+                    .rev()
+                    .find(|s| *offset >= s.range.start && *offset < s.range.end);
+                let mut style = match span.and_then(|s| s.fg) {
+                    Some((r, g, b)) => {
+                        let mut style = Style::default().fg(Color::Rgb(r, g, b));
+                        if span.is_some_and(|s| s.italic) {
+                            style = style.add_modifier(Modifier::ITALIC);
+                        }
+                        style
+                    }
+                    None => Style::default(),
+                };
+                if *offset >= selection.start && *offset < selection.end {
+                    style = style.bg(Color::Rgb(38, 46, 58));
+                }
                 spans_line.push(Span::styled(ch.to_string(), style));
             }
+            out.push(Line::from(spans_line));
         }
-        out.push(Line::from(spans_line));
     }
     (out, first_row)
 }
@@ -861,14 +973,13 @@ fn render_context_area(frame: &mut ratatui::Frame, area: Rect, app: &mut PortApp
     }
     app.scroll_label = app.scroll_label();
 
-    let (lines, first_row) = context_to_lines(app, &context, &rows, app.v_scroll, height);
+    let (lines, first_row) = context_to_lines(app, &context, &rows, app.v_scroll, height, width);
     let scroll_y = app.v_scroll.saturating_sub(first_row);
-    let mut paragraph = Paragraph::new(lines)
+    // Rows are pre-wrapped (with continuation rails); the paragraph only
+    // clips them to the pane.
+    let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL))
         .scroll((scroll_y as u16, app.h_scroll as u16));
-    if app.wrap {
-        paragraph = paragraph.wrap(Wrap { trim: false });
-    }
     frame.render_widget(paragraph, area);
 }
 
@@ -1942,6 +2053,98 @@ mod tests {
         assert_eq!(rendered_rows("\tword", 80, true, 4), 1);
         assert!(rendered_rows("\taaaaaaaaaa", 8, true, 4) > 1);
         assert_eq!(rendered_rows("\tword", 80, true, 2), 1);
+    }
+
+    #[test]
+    fn wrap_columns_preserves_first_row_indentation() {
+        let row = |text: &str, width: usize| {
+            wrap_columns(text, width, 4)
+                .into_iter()
+                .map(|cols| cols.into_iter().map(|(ch, _)| ch).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        // Leading indentation (a tab expands to 4 spaces) survives on the
+        // first row.
+        assert_eq!(row("\tlet x = 1;", 80), vec!["    let x = 1;"]);
+        // Inter-word gaps collapse to one space.
+        assert_eq!(row("a   b", 80), vec!["a b"]);
+        // A reflowed row drops the indentation it would have carried.
+        let wrapped = row("first  second third", 12);
+        assert_eq!(wrapped, vec!["first second", "third"]);
+    }
+
+    #[test]
+    fn wrapped_continuation_rows_keep_the_rail() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "// TODO: some long comment that will definitely wrap around\nfn main() {}\n",
+        )
+        .unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: None,
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let run = CommentRun {
+            comments: vec![Comment {
+                path: "src/a.rs".into(),
+                line: 1,
+                end_line: 1,
+                column: 0,
+                byte_range: 0..55,
+                text: "// TODO: some long comment that will definitely wrap around".into(),
+                language: "rust".into(),
+            }],
+        };
+        let finding = Finding {
+            run,
+            category: "TODO".into(),
+            primary: 0,
+            selection: Selection::full(1),
+        };
+        let mut app = PortApp::new(Session::new(vec![finding], "abc".into()), &ctx);
+
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let out = buffer_to_string(terminal.backend().buffer());
+
+        // The first row of the wrapped line carries the gutter number...
+        let first = out
+            .lines()
+            .find(|line| line.contains("// TODO: some long"))
+            .unwrap();
+        let first_gutter = first.split('│').nth(1).unwrap_or("");
+        assert!(
+            first_gutter
+                .split_whitespace()
+                .last()
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_some(),
+            "first row must show the line number: {first:?}"
+        );
+
+        // ...while the reflowed tail keeps the rail but no number.
+        let tail = out
+            .lines()
+            .find(|line| line.contains("definitely wrap"))
+            .unwrap();
+        assert!(
+            tail.starts_with('│'),
+            "continuation row must start at the rail: {tail:?}"
+        );
+        let tail_gutter = tail.split('│').nth(1).unwrap_or("");
+        assert!(
+            tail_gutter.trim().is_empty(),
+            "reflowed rows must not carry a line number: {tail:?}"
+        );
     }
 
     #[test]
