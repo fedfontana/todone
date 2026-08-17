@@ -977,10 +977,13 @@ fn context_to_lines(
             let mut spans_line = Vec::new();
             spans_line.push(Span::styled(gutter, gutter_style));
             for (ch, offset) in row {
+                // The reflow stream carries line-relative offsets; spans and
+                // the selection are file-absolute.
+                let offset = line.byte_range.start + offset;
                 let span = spans
                     .iter()
                     .rev()
-                    .find(|s| *offset >= s.range.start && *offset < s.range.end);
+                    .find(|s| offset >= s.range.start && offset < s.range.end);
                 let mut style = match span.and_then(|s| s.fg) {
                     Some((r, g, b)) => {
                         let mut style = Style::default().fg(Color::Rgb(r, g, b));
@@ -991,7 +994,7 @@ fn context_to_lines(
                     }
                     None => Style::default(),
                 };
-                if *offset >= selection.start && *offset < selection.end {
+                if offset >= selection.start && offset < selection.end {
                     style = style.bg(Color::Rgb(38, 46, 58));
                 }
                 spans_line.push(Span::styled(ch.to_string(), style));
@@ -1737,6 +1740,75 @@ mod tests {
             "tab must expand to four spaces:\n{content}"
         );
         assert!(!content.contains('\t'), "no raw tabs in the buffer");
+    }
+
+    #[test]
+    fn pane_styling_uses_file_absolute_offsets() {
+        // Highlights and the selection must line up with the actual columns:
+        // the comment is on line 2, so line-relative offsets would shift every
+        // style left by the first line's length.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "fn main() {\n    let x = 1; // TODO: x\n}\n",
+        )
+        .unwrap();
+        let repo = todone_core::repo::RepoInfo {
+            root: dir.path().to_path_buf(),
+            commit: None,
+            is_repo: true,
+            remote: None,
+        };
+        let ctx = ScanContext {
+            config: todone_core::config::Config::defaults(),
+            repo,
+        };
+        let content = std::fs::read_to_string(dir.path().join("src/a.rs")).unwrap();
+        let mut app = PortApp::new(
+            Session::new(vec![finding_at(&content, "// TODO: x", 2)], "abc".into()),
+            &ctx,
+        );
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let selection_bg = Color::Rgb(38, 46, 58);
+        let comment_fg = Color::Rgb(120, 129, 141);
+        let keyword_fg = Color::Rgb(198, 120, 221);
+        let mut checked = 0;
+        for y in 0..buffer.area.height {
+            let mut row = String::new();
+            for x in 0..buffer.area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            if !row.contains("// TODO: x") {
+                continue;
+            }
+            checked += 1;
+            // `find` yields byte offsets, but the buffer is indexed by
+            // column: the rail characters are multi-byte.
+            let byte_to_col = |byte: usize| row[..byte].chars().count() as u16;
+            let let_x = byte_to_col(row.find("let").unwrap());
+            let comment_x = byte_to_col(row.find("// TODO: x").unwrap());
+            // The selection covers the comment, not the code before it.
+            assert_eq!(
+                buffer[(comment_x, y)].style().bg,
+                Some(selection_bg),
+                "{row:?}"
+            );
+            assert_ne!(buffer[(let_x, y)].style().bg, Some(selection_bg), "{row:?}");
+            // Syntax colors land on their own tokens.
+            assert_eq!(
+                buffer[(comment_x, y)].style().fg,
+                Some(comment_fg),
+                "{row:?}"
+            );
+            assert_eq!(buffer[(let_x, y)].style().fg, Some(keyword_fg), "{row:?}");
+        }
+        assert!(checked >= 1, "comment line not rendered");
     }
 
     #[test]
