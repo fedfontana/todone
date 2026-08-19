@@ -1,5 +1,8 @@
 # todone
 
+> [!WARNING]
+> This project is a 100% vibe coded proof of concept. It still has many rough edges and may have errors. Subject to frequent changes
+
 `todone` is a CLI for triaging marker comments (`TODO`, `FIXME`, ...) in a
 repository. It scans your code with tree-sitter, walks you through every
 finding in an interactive review, lets you **port** them into forge issues
@@ -247,5 +250,3 @@ Pre-commit hooks (rustfmt, clippy, cargo test) run via devenv.
   grammar; user-supplied highlight themes.
 - Issue labels and severity mapped from categories; deduplication of
   identical comments.
-- GUI mode: a libghostty window with an editor pane and the todone pane,
-  reusing the same session state.
